@@ -1121,14 +1121,6 @@ class Chrome(WebBrowser):
             self.artifacts_counts['Sessions'] = 'Failed'
             return
 
-        def webkit_ts(microseconds):
-            """Convert a Webkit/Windows epoch microsecond timestamp to a timezone-aware datetime."""
-            if microseconds == 0:
-                return utils.to_datetime(0, self.timezone)
-            ts = datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc) \
-                + datetime.timedelta(microseconds=microseconds)
-            return utils.to_datetime(ts, self.timezone)
-
         # Session file command IDs (SessionRestoreIdType)
         SESSION_TAB_CLOSED = 16
         SESSION_WINDOW_CLOSED = 17
@@ -1452,7 +1444,7 @@ class Chrome(WebBrowser):
                                     continue
                                 item = Chrome.SessionItem(
                                     self.profile_path, url='', title='',
-                                    timestamp=webkit_ts(close_time), session_id=tab_id,
+                                    timestamp=utils.to_datetime(close_time, self.timezone), session_id=tab_id,
                                     source_path=file_path)
                                 item.row_type = 'session (tab closed)'
                                 item.source_item = source_item
@@ -1466,7 +1458,7 @@ class Chrome(WebBrowser):
                                     continue
                                 item = Chrome.SessionItem(
                                     self.profile_path, url='', title='',
-                                    timestamp=webkit_ts(close_time), source_path=file_path)
+                                    timestamp=utils.to_datetime(close_time, self.timezone), source_path=file_path)
                                 item.row_type = 'session (window closed)'
                                 # For window events, session_id holds the window_id
                                 item.session_id = window_id
@@ -1481,7 +1473,7 @@ class Chrome(WebBrowser):
                                     continue
                                 item = Chrome.SessionItem(
                                     self.profile_path, url='', title='',
-                                    timestamp=webkit_ts(active_time), session_id=tab_id,
+                                    timestamp=utils.to_datetime(active_time, self.timezone), session_id=tab_id,
                                     source_path=file_path)
                                 item.row_type = 'session (tab last active)'
                                 item.source_item = source_item
@@ -1497,7 +1489,7 @@ class Chrome(WebBrowser):
                                     continue
                                 item = Chrome.SessionItem(
                                     self.profile_path, url='', title='',
-                                    timestamp=webkit_ts(close_time), session_id=tab_id,
+                                    timestamp=utils.to_datetime(close_time, self.timezone), session_id=tab_id,
                                     nav_index=nav_index, source_path=file_path)
                                 item.row_type = 'session (closed tab)'
                                 item.value = f'Navigation Index: {nav_index}'
@@ -1536,7 +1528,7 @@ class Chrome(WebBrowser):
 
                                     item = Chrome.SessionItem(
                                         self.profile_path, url='', title='',
-                                        timestamp=webkit_ts(close_time), source_path=file_path)
+                                        timestamp=utils.to_datetime(close_time, self.timezone), source_path=file_path)
                                     # For window events, store window_id as session_id for the Window ID column
                                     item.session_id = window_id
                                     item.row_type = 'session (closed window)'
@@ -2614,6 +2606,96 @@ class Chrome(WebBrowser):
         self.artifacts_counts['Platform Notifications'] = len(result_list)
         self.parsed_artifacts.extend(result_list)
 
+    def get_service_workers(self, path, dir_name):
+        """Parse service worker registrations from the Service Worker/Database LevelDB.
+
+        Decodes the ServiceWorkerRegistrationData protobuf stored under REG: keys.
+        See content/browser/service_worker/service_worker_database.proto in Chromium.
+        """
+        results = []
+
+        sw_root_path = os.path.join(path, dir_name)
+        ldb_path = os.path.join(sw_root_path, 'Database')
+        log.info('Service Workers:')
+        log.info(f' - Reading from {ldb_path}')
+
+        if not os.path.isdir(ldb_path):
+            log.error(f' - {ldb_path} is not a directory')
+            self.artifacts_counts['Service Workers'] = 'Failed'
+            return
+
+        log.info(f' - Using ccl_leveldb v{ccl_chromium_reader.storage_formats.ccl_leveldb.__version__}')
+
+        ldb_records = None
+        try:
+            ldb_records = ccl_chromium_reader.storage_formats.ccl_leveldb.RawLevelDb(pathlib.Path(ldb_path))
+        except ValueError as e:
+            log.warning(f' - Error reading records ({e}); possible LevelDB corruption')
+            self.artifacts_counts['Service Workers'] = 'Failed'
+            return
+
+        from pyhindsight.lib.proto.components.services.storage.service_worker.service_worker_database_pb2 import \
+            ServiceWorkerRegistrationData
+
+        def enum_name(descriptor, value):
+            if value is None:
+                return None
+            ev = descriptor.values_by_number.get(value)
+            return ev.name if ev else value
+
+        try:
+            for record in ldb_records.iterate_records_raw():
+                if not record.user_key.startswith(b'REG:'):
+                    continue
+                if not record.value:
+                    # Empty value indicates a deletion marker
+                    continue
+                reg = ServiceWorkerRegistrationData()
+                try:
+                    reg.ParseFromString(record.value)
+                except Exception as e:
+                    log.warning(f' - Failed to decode REG record: {e}')
+                    continue
+
+                nav_preload_enabled = None
+                nav_preload_header = None
+                if reg.HasField('navigation_preload_state'):
+                    nav_preload_enabled = reg.navigation_preload_state.enabled
+                    if reg.navigation_preload_state.HasField('header'):
+                        nav_preload_header = reg.navigation_preload_state.header
+
+                results.append(Chrome.ServiceWorkerItem(
+                    profile=self.profile_path,
+                    origin=reg.scope_url,
+                    scope_url=reg.scope_url,
+                    script_url=reg.script_url,
+                    registration_id=reg.registration_id,
+                    version_id=reg.version_id,
+                    is_active=reg.is_active,
+                    has_fetch_handler=reg.has_fetch_handler,
+                    last_update_check_time=utils.to_datetime(reg.last_update_check_time, self.timezone),
+                    resources_total_size_bytes=reg.resources_total_size_bytes if reg.HasField(
+                        'resources_total_size_bytes') else None,
+                    navigation_preload_enabled=nav_preload_enabled,
+                    navigation_preload_header=nav_preload_header,
+                    update_via_cache=enum_name(
+                        ServiceWorkerRegistrationData.ServiceWorkerUpdateViaCacheType.DESCRIPTOR,
+                        reg.update_via_cache),
+                    script_type=enum_name(
+                        ServiceWorkerRegistrationData.ServiceWorkerScriptType.DESCRIPTOR,
+                        reg.script_type),
+                    script_response_time=utils.to_datetime(reg.script_response_time, self.timezone)
+                        if reg.HasField('script_response_time') else None,
+                    seq=record.seq,
+                    state=record.state.name,
+                    source_path=str(record.origin_file),
+                ))
+        finally:
+            ldb_records.close()
+
+        log.info(f' - Parsed {len(results)} service worker registration records')
+        self.artifacts_counts['Service Workers'] = len(results)
+        self.parsed_storage.extend(results)
 
     def get_cache(self, path, dir_name, row_type=None):
         # Set up empty return array
@@ -3115,7 +3197,7 @@ class Chrome(WebBrowser):
         items = utils.get_ldb_records(sc_root_path)
         for item in items:
             try:
-                from pyhindsight.lib.site_data_pb2 import SiteDataProto
+                from pyhindsight.lib.proto.components.performance_manager.persistence.site_data.site_data_pb2 import SiteDataProto
 
                 if item['key'] == b'database_metadata':
                     if item['value'] != b'1':
@@ -3172,15 +3254,15 @@ class Chrome(WebBrowser):
 
         items = utils.get_ldb_records(sync_data_root_path)
 
-        from pyhindsight.lib.buf.components.sync.protocol.device_info_specifics_pb2 import DeviceInfoSpecifics
-        from pyhindsight.lib.buf.components.sync.protocol.session_specifics_pb2 import SessionSpecifics
-        from pyhindsight.lib.buf.components.sync.protocol.entity_metadata_pb2 import EntityMetadata
-        from pyhindsight.lib.buf.components.sync.protocol.data_type_state_pb2 import DataTypeState
-        from pyhindsight.lib.buf.components.sync.protocol.user_event_specifics_pb2 import UserEventSpecifics
-        from pyhindsight.lib.buf.components.sync.protocol.app_specifics_pb2 import AppSpecifics
-        from pyhindsight.lib.buf.components.sync.protocol.user_consent_specifics_pb2 import UserConsentSpecifics
-        from pyhindsight.lib.buf.components.sync.protocol.persisted_entity_data_pb2 import PersistedEntityData
-        from pyhindsight.lib.buf.components.sync.protocol.sync_enums_pb2 import SyncEnums
+        from pyhindsight.lib.proto.components.sync.protocol.device_info_specifics_pb2 import DeviceInfoSpecifics
+        from pyhindsight.lib.proto.components.sync.protocol.session_specifics_pb2 import SessionSpecifics
+        from pyhindsight.lib.proto.components.sync.protocol.entity_metadata_pb2 import EntityMetadata
+        from pyhindsight.lib.proto.components.sync.protocol.data_type_state_pb2 import DataTypeState
+        from pyhindsight.lib.proto.components.sync.protocol.user_event_specifics_pb2 import UserEventSpecifics
+        from pyhindsight.lib.proto.components.sync.protocol.app_specifics_pb2 import AppSpecifics
+        from pyhindsight.lib.proto.components.sync.protocol.user_consent_specifics_pb2 import UserConsentSpecifics
+        from pyhindsight.lib.proto.components.sync.protocol.persisted_entity_data_pb2 import PersistedEntityData
+        from pyhindsight.lib.proto.components.sync.protocol.sync_enums_pb2 import SyncEnums
 
         os_type_labels = {
             'OS_TYPE_UNSPECIFIED': 'Unspecified',
@@ -3452,7 +3534,7 @@ class Chrome(WebBrowser):
         supported_databases = ['History', 'Archived History', 'Media History', 'Web Data', 'Cookies',
                                'Login Data', 'Login Data For Account'
                                'Extension Cookies', 'Network Action Predictor', 'DIPS']
-        supported_subdirs = ['Local Storage', 'Extensions', 'File System', 'Platform Notifications', 'Network', 'Sessions']
+        supported_subdirs = ['Local Storage', 'Extensions', 'File System', 'Platform Notifications', 'Network', 'Sessions', 'Service Worker']
         supported_jsons = ['Bookmarks', 'TransportSecurity']  # , 'Preferences']
         supported_items = supported_databases + supported_subdirs + supported_jsons
         log.debug(f'Supported items: {supported_items}')
@@ -3702,6 +3784,12 @@ class Chrome(WebBrowser):
                     'Platform Notifications', 'Platform Notifications', self.get_platform_notifications,
                     self.profile_path, 'Platform Notifications',
                     display_key='Platform Notifications', display_value='Platform Notification records')
+
+            if 'Service Worker' in input_listing:
+                run_with_status(
+                    'Service Workers', 'Service Workers', self.get_service_workers,
+                    self.profile_path, 'Service Worker',
+                    display_key='Service Workers', display_value='Service Worker registrations')
 
             # Browser Extensions
             current_group = "Browser Extensions"

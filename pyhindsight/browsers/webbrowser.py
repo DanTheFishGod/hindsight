@@ -565,3 +565,42 @@ class WebBrowser(object):
             self.file_exists = file_exists
             self.file_size = file_size
             self.magic_results = magic_results
+
+    class ServiceWorkerItem(StorageItem):
+        def __init__(self, profile, origin, scope_url, script_url, registration_id, version_id,
+                     is_active, has_fetch_handler, last_update_check_time, resources_total_size_bytes,
+                     navigation_preload_enabled, navigation_preload_header, update_via_cache,
+                     script_type, script_response_time, seq, state, source_path):
+            value_parts = [f'registration_id={registration_id}', f'version_id={version_id}']
+            if is_active is not None:
+                value_parts.append(f'is_active={is_active}')
+            if has_fetch_handler is not None:
+                value_parts.append(f'has_fetch_handler={has_fetch_handler}')
+            if resources_total_size_bytes is not None:
+                value_parts.append(f'resources_total_size_bytes={resources_total_size_bytes}')
+            if navigation_preload_enabled is not None:
+                value_parts.append(f'navigation_preload_enabled={navigation_preload_enabled}')
+            if navigation_preload_header:
+                value_parts.append(f'navigation_preload_header={navigation_preload_header}')
+            if update_via_cache is not None:
+                value_parts.append(f'update_via_cache={update_via_cache}')
+            if script_type is not None:
+                value_parts.append(f'script_type={script_type}')
+            if script_response_time is not None:
+                value_parts.append(f'script_response_time={script_response_time}')
+            super(WebBrowser.ServiceWorkerItem, self).__init__(
+                'service worker', profile=profile, origin=origin, key=script_url,
+                value='; '.join(value_parts), seq=seq, state=state, source_path=source_path,
+                last_modified=last_update_check_time)
+            self.scope_url = scope_url
+            self.script_url = script_url
+            self.registration_id = registration_id
+            self.version_id = version_id
+            self.is_active = is_active
+            self.has_fetch_handler = has_fetch_handler
+            self.resources_total_size_bytes = resources_total_size_bytes
+            self.navigation_preload_enabled = navigation_preload_enabled
+            self.navigation_preload_header = navigation_preload_header
+            self.update_via_cache = update_via_cache
+            self.script_type = script_type
+            self.script_response_time = script_response_time
