@@ -75,7 +75,7 @@ The Chrome Profile folder default locations are:
                              'directory is specified instead, Hindsight will recursively search for profiles.', )
     parser.add_argument('-o', '--output', help='Name of the output file (without extension)')
     parser.add_argument('-b', '--browser_type', help='Type of input files', default='Chrome',
-                        choices=['Chrome'])
+                        choices=['Chrome', 'Firefox'])
     parser.add_argument('-f', '--format', choices=analysis_session.available_output_formats,
                         default=analysis_session.available_output_formats[-1], help='Output format')
     parser.add_argument('-l', '--log', help='Location Hindsight should log to (will append if exists)',

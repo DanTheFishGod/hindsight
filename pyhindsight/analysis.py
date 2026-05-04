@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pyhindsight import __version__
 from pyhindsight.browsers.chrome import Chrome
 from pyhindsight.browsers.brave import Brave
+from pyhindsight.browsers.firefox import Firefox
 from pyhindsight.browsers.webbrowser import WebBrowser
 from pyhindsight.utils import friendly_date
 import pyhindsight.plugins
@@ -468,7 +469,7 @@ class AnalysisSession(object):
             self.version = []
 
         if self.available_input_types is None:
-            self.available_input_types = ['Chrome']
+            self.available_input_types = ['Chrome', 'Firefox']
 
         if self.parsed_artifacts is None:
             self.parsed_artifacts = []
@@ -596,18 +597,19 @@ class AnalysisSession(object):
 
     @staticmethod
     def is_profile(base_path, existing_files, warn=False):
-        """Log a warning message if any file in `required_files` is missing from
-        `existing_files`. Return True if all required files are present.
+        """Return True if `base_path` looks like a browser profile we can parse.
+
+        A Chromium profile has a ``History`` SQLite file; a Firefox profile has
+        ``places.sqlite``. Either is enough to consider this a profile.
         """
-        is_profile = True
-        for required_file in ['History']:
-            # This approach (checking the file names) is naive but should work.
-            if required_file not in existing_files or not os.path.isfile(os.path.join(base_path, required_file)):
-                if warn:
-                    log.warning(f"The profile directory {base_path} does not contain the "
-                                f"file {required_file}. Analysis may not be very useful.")
-                is_profile = False
-        return is_profile
+        for required_file in ['History', 'places.sqlite']:
+            if required_file in existing_files and os.path.isfile(os.path.join(base_path, required_file)):
+                return True
+
+        if warn:
+            log.warning(f"The profile directory {base_path} does not contain a recognized "
+                        f"browser history file (History or places.sqlite). Analysis may not be very useful.")
+        return False
 
     def search_subdirs(self, base_path):
         """Recursively search a path for browser profiles"""
@@ -729,6 +731,28 @@ class AnalysisSession(object):
                     if isinstance(browser_analysis.__dict__[item], dict):
                         try:
                             # If the browser_analysis attribute has 'presentation' and 'data' subkeys, promote from
+                            if browser_analysis.__dict__[item].get('presentation') and \
+                                    browser_analysis.__dict__[item].get('data'):
+                                self.promote_object_to_analysis_session(item, browser_analysis.__dict__[item])
+                        except Exception as e:
+                            log.info(f'Exception occurred while analyzing {item} for analysis session promotion: {e}')
+
+            elif self.browser_type == "Firefox":
+                browser_analysis = Firefox(found_profile_path, cache_path=self.cache_path,
+                                           timezone=self.timezone,
+                                           no_copy=self.no_copy, temp_dir=self.temp_dir)
+                browser_analysis.process()
+                self.parsed_artifacts.extend(browser_analysis.parsed_artifacts)
+                self.parsed_storage.extend(browser_analysis.parsed_storage)
+                self.artifacts_counts = self.sum_dict_counts(self.artifacts_counts, browser_analysis.artifacts_counts)
+                self.artifacts_display = browser_analysis.artifacts_display
+                self.version.extend(browser_analysis.version)
+                self.display_version = browser_analysis.display_version
+                self.preferences.extend(browser_analysis.preferences)
+
+                for item in browser_analysis.__dict__:
+                    if isinstance(browser_analysis.__dict__[item], dict):
+                        try:
                             if browser_analysis.__dict__[item].get('presentation') and \
                                     browser_analysis.__dict__[item].get('data'):
                                 self.promote_object_to_analysis_session(item, browser_analysis.__dict__[item])

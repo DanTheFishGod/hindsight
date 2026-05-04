@@ -54,6 +54,7 @@
                                     <b>Input Type:</b>
                                     <select name="browser_type" onchange="toggle(this.value)">
                                         <option value="Chrome">Chrome</option>
+                                        <option value="Firefox">Firefox</option>
                                     </select>
                                 </td>
                                 <td style="text-align: right;">
@@ -111,6 +112,24 @@
                                         <tr><td class="input-option">iOS:</td><td> \Applications\com.google.chrome.ios\Library\Application Support\Google\Chrome</td></tr>
                                         <tr><td class="input-option">Android:</td><td> /userdata/data/com.android.chrome/app_chrome</td></tr>
                                         <tr><td class="input-option" colspan=2>In a running Chrome browser, go to chrome://version/ to see the Profile Path information</td></tr>
+                                    </table>
+                                </td>
+                            </tr>
+                            <tr id="description-Firefox" style="display:none;">
+                                <td colspan=2 class="input-description">
+                                    <table>
+                                        <tr><td>
+                                            <b>Description:</b> Firefox is a free, open-source web browser developed by Mozilla. Each user's history, bookmarks, cookies, and form data are stored under their user directory in a <i>profile</i> folder. A typical Firefox install has at least one profile (e.g. <code>xxxxxxxx.default-release</code>) and may have more.
+                                            <br /><br />
+                                        </td></tr>
+                                    </table>
+                                    <br />
+                                    <b>Default Profile Locations:</b>
+                                    <table>
+                                        <tr><td class="input-option">Windows (Vista - 11):</td><td> \[userdir]\AppData\Roaming\Mozilla\Firefox\Profiles\&lt;profile&gt;</td></tr>
+                                        <tr><td class="input-option">Linux:</td><td> \[userdir]/.mozilla/firefox/&lt;profile&gt;</td></tr>
+                                        <tr><td class="input-option">OSX/macOS:</td><td> \[userdir]/Library/Application Support/Firefox/Profiles/&lt;profile&gt;</td></tr>
+                                        <tr><td class="input-option" colspan=2>In a running Firefox browser, visit about:profiles to see the Profile Path.</td></tr>
                                     </table>
                                 </td>
                             </tr>
