@@ -75,6 +75,71 @@ class Firefox(WebBrowser):
         finally:
             conn.close()
 
+    def get_history(self, path, database='places.sqlite', row_type='url'):
+        results = []
+        log.info(f'History items from {database}:')
+
+        conn = self._open(path, database)
+        if not conn:
+            return
+
+        try:
+            cursor = conn.cursor()
+            # `hidden` rows are framed/redirect-only entries the user didn't navigate to;
+            # keep them so examiners can filter in the output rather than us deciding.
+            query = (
+                "SELECT p.id AS place_id, p.url, p.title, p.visit_count, "
+                "       p.typed, p.hidden, p.last_visit_date, p.frecency, "
+                "       p.description, p.preview_image_url, "
+                "       v.id AS visit_id, v.visit_date, v.visit_type, "
+                "       v.from_visit, v.session, "
+                "       (SELECT url FROM moz_places "
+                "         WHERE id = (SELECT place_id FROM moz_historyvisits "
+                "                      WHERE id = v.from_visit)) AS from_url "
+                "FROM moz_places p "
+                "JOIN moz_historyvisits v ON p.id = v.place_id"
+            )
+            try:
+                cursor.execute(query)
+            except Exception as e:
+                log.error(f' - Could not query history: {e}')
+                self.artifacts_counts[database] = 'Failed'
+                return
+
+            source_item = os.path.relpath(os.path.join(path, database), self.profile_path)
+            for row in cursor:
+                visit_time = utils.to_datetime(row.get('visit_date'), self.timezone)
+                last_visit_time = utils.to_datetime(row.get('last_visit_date'), self.timezone) \
+                    if row.get('last_visit_date') else visit_time
+
+                new_row = Firefox.URLItem(
+                    profile=self.profile_path,
+                    visit_id=row.get('visit_id'),
+                    url=row.get('url'),
+                    title=row.get('title'),
+                    visit_time=visit_time,
+                    last_visit_time=last_visit_time,
+                    visit_count=row.get('visit_count'),
+                    typed_count=row.get('typed'),  # 0/1 flag in Firefox, not a count
+                    from_visit=row.get('from_visit'),
+                    transition=row.get('visit_type'),
+                    hidden=row.get('hidden'),
+                    favicon_id=None,
+                )
+                new_row.row_type = row_type
+                new_row.transition_friendly = Firefox._visit_type_friendly(row.get('visit_type'))
+                new_row.source_item = source_item
+                from_url = row.get('from_url')
+                if from_url:
+                    new_row.interpretation = f'Referrer: {from_url}'
+                results.append(new_row)
+
+            self.artifacts_counts[database] = len(results)
+            log.info(f' - Parsed {len(results)} items')
+            self.parsed_artifacts.extend(results)
+        finally:
+            conn.close()
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -86,6 +151,11 @@ class Firefox(WebBrowser):
             self.determine_version(self.profile_path, 'places.sqlite')
             print((self.format_processing_output(
                 f'Detected {self.browser_name} schema', self.display_version or 'unknown')))
+
+            self.get_history(self.profile_path, 'places.sqlite')
+            self.artifacts_display['places.sqlite'] = 'URL records'
+            print((self.format_processing_output(
+                'URL records', self.artifacts_counts.get('places.sqlite', 0))))
 
         self.parsed_artifacts.sort()
 
