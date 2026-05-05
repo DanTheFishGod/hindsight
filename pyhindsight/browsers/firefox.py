@@ -23,6 +23,11 @@ FIREFOX_VISIT_TYPES = {
     9: 'Reload',
 }
 
+# moz_bookmarks.type values
+BOOKMARK_TYPE_URL = 1
+BOOKMARK_TYPE_FOLDER = 2
+BOOKMARK_TYPE_SEPARATOR = 3
+
 
 class Firefox(WebBrowser):
     def __init__(self, profile_path, browser_name=None, cache_path=None, version=None, timezone=None,
@@ -140,6 +145,61 @@ class Firefox(WebBrowser):
         finally:
             conn.close()
 
+    def get_bookmarks(self, path, database='places.sqlite'):
+        # moz_bookmarks stores folders and bookmarks in the same table; split by `type`.
+        results = []
+        log.info(f'Bookmark items from {database}:')
+
+        conn = self._open(path, database)
+        if not conn:
+            return
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT b.id, b.type, b.fk, b.parent, b.title, b.dateAdded, "
+                "       b.lastModified, b.guid, p.url "
+                "FROM moz_bookmarks b "
+                "LEFT JOIN moz_places p ON b.fk = p.id"
+            )
+            rows = cursor.fetchall()
+            folder_titles = {r['id']: (r['title'] or '') for r in rows if r['type'] == BOOKMARK_TYPE_FOLDER}
+
+            for row in rows:
+                bm_type = row.get('type')
+                parent_folder = folder_titles.get(row.get('parent'), '')
+                date_added = utils.to_datetime(row.get('dateAdded'), self.timezone)
+                date_modified = utils.to_datetime(row.get('lastModified'), self.timezone) \
+                    if row.get('lastModified') else date_added
+
+                if bm_type == BOOKMARK_TYPE_URL:
+                    item = Firefox.BookmarkItem(
+                        profile=self.profile_path,
+                        date_added=date_added,
+                        name=row.get('title') or '',
+                        url=row.get('url'),
+                        parent_folder=parent_folder,
+                    )
+                    results.append(item)
+                elif bm_type == BOOKMARK_TYPE_FOLDER:
+                    # Skip the synthetic top-level roots (menu/toolbar/tags/unfiled/mobile).
+                    if row.get('parent') in (None, 0):
+                        continue
+                    item = Firefox.BookmarkFolderItem(
+                        profile=self.profile_path,
+                        date_added=date_added,
+                        date_modified=date_modified,
+                        name=row.get('title') or '',
+                        parent_folder=parent_folder,
+                    )
+                    results.append(item)
+
+            self.artifacts_counts['Bookmarks'] = len(results)
+            log.info(f' - Parsed {len(results)} items')
+            self.parsed_artifacts.extend(results)
+        finally:
+            conn.close()
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -156,6 +216,11 @@ class Firefox(WebBrowser):
             self.artifacts_display['places.sqlite'] = 'URL records'
             print((self.format_processing_output(
                 'URL records', self.artifacts_counts.get('places.sqlite', 0))))
+
+            self.get_bookmarks(self.profile_path, 'places.sqlite')
+            self.artifacts_display['Bookmarks'] = 'Bookmark records'
+            print((self.format_processing_output(
+                'Bookmark records', self.artifacts_counts.get('Bookmarks', 0))))
 
         self.parsed_artifacts.sort()
 
