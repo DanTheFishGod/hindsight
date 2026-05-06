@@ -3,6 +3,7 @@ import copy
 import datetime
 import logging
 import os
+import urllib.parse
 
 from pyhindsight import utils
 from pyhindsight.browsers.webbrowser import WebBrowser
@@ -276,6 +277,72 @@ class Firefox(WebBrowser):
         finally:
             conn.close()
 
+    def get_downloads(self, path, database='places.sqlite'):
+        # Firefox 24+ stores downloads as moz_annos rows (`downloads/destinationFileURI`)
+        # rather than the legacy downloads.sqlite.
+        results = []
+        log.info(f'Download items from {database}:')
+
+        conn = self._open(path, database)
+        if not conn:
+            return
+
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT p.url, a.content AS target, a.dateAdded AS start_time, "
+                    "       a.lastModified AS end_time, p.id AS place_id "
+                    "FROM moz_places p "
+                    "JOIN moz_annos a ON p.id = a.place_id "
+                    "JOIN moz_anno_attributes aa ON a.anno_attribute_id = aa.id "
+                    "WHERE aa.name = 'downloads/destinationFileURI'"
+                )
+            except Exception as e:
+                log.error(f' - Could not query downloads: {e}')
+                self.artifacts_counts[database + '_downloads'] = 'Failed'
+                return
+
+            source_item = os.path.relpath(os.path.join(path, database), self.profile_path)
+            for row in cursor:
+                start = utils.to_datetime(row.get('start_time'), self.timezone)
+                end = utils.to_datetime(row.get('end_time'), self.timezone) if row.get('end_time') else start
+                target = row.get('target') or ''
+                if target.startswith('file:///'):
+                    try:
+                        target = urllib.parse.unquote(target[len('file:///'):])
+                    except Exception:
+                        pass
+
+                item = Firefox.DownloadItem(
+                    profile=self.profile_path,
+                    download_id=row.get('place_id'),
+                    url=row.get('url'),
+                    received_bytes=None,
+                    total_bytes=None,
+                    state=None,
+                    full_path=target,
+                    start_time=start,
+                    end_time=end,
+                    target_path=target,
+                    current_path=target,
+                )
+                item.row_type = 'download'
+                item.timestamp = start
+                item.value = target or 'Error retrieving download location'
+                item.status_friendly = ''
+                item.interrupt_reason_friendly = ''
+                item.danger_type_friendly = ''
+                item.state_friendly = ''
+                item.source_item = source_item
+                results.append(item)
+
+            self.artifacts_counts[database + '_downloads'] = len(results)
+            log.info(f' - Parsed {len(results)} items')
+            self.parsed_artifacts.extend(results)
+        finally:
+            conn.close()
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -297,6 +364,11 @@ class Firefox(WebBrowser):
             self.artifacts_display['Bookmarks'] = 'Bookmark records'
             print((self.format_processing_output(
                 'Bookmark records', self.artifacts_counts.get('Bookmarks', 0))))
+
+            self.get_downloads(self.profile_path, 'places.sqlite')
+            self.artifacts_display['places.sqlite_downloads'] = 'Download records'
+            print((self.format_processing_output(
+                'Download records', self.artifacts_counts.get('places.sqlite_downloads', 0))))
 
         if 'cookies.sqlite' in input_listing:
             self.get_cookies(self.profile_path, 'cookies.sqlite')
