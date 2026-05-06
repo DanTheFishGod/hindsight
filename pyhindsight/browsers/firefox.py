@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import copy
 import datetime
 import logging
 import os
@@ -200,6 +201,81 @@ class Firefox(WebBrowser):
         finally:
             conn.close()
 
+    def get_cookies(self, path, database='cookies.sqlite'):
+        # Firefox cookies are unencrypted at rest. Emit separate (created)
+        # and (accessed) rows like the Chrome parser does.
+        results = []
+        log.info(f'Cookie items from {database}:')
+
+        conn = self._open(path, database)
+        if not conn:
+            return
+
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT name, value, host, path, expiry, lastAccessed, creationTime, "
+                    "       isSecure, isHttpOnly, sameSite "
+                    "FROM moz_cookies"
+                )
+            except Exception as e:
+                log.error(f' - Could not query cookies: {e}')
+                self.artifacts_counts[database] = 'Failed'
+                return
+
+            source_item = os.path.relpath(os.path.join(path, database), self.profile_path)
+            zero_ts = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
+            for row in cursor:
+                creation = utils.to_datetime(row.get('creationTime'), self.timezone)
+                accessed = utils.to_datetime(row.get('lastAccessed'), self.timezone)
+                # `expiry` is unix seconds (not PRTime). 0 means session cookie.
+                expiry_raw = row.get('expiry')
+                if expiry_raw:
+                    try:
+                        expires = datetime.datetime.fromtimestamp(int(expiry_raw), datetime.timezone.utc)
+                        if self.timezone:
+                            expires = expires.astimezone(self.timezone)
+                    except (OverflowError, OSError, ValueError):
+                        expires = None
+                else:
+                    expires = None
+
+                base = Firefox.CookieItem(
+                    profile=self.profile_path,
+                    host_key=row.get('host'),
+                    path=row.get('path'),
+                    name=row.get('name'),
+                    value=row.get('value'),
+                    creation_utc=creation,
+                    last_access_utc=accessed,
+                    secure=bool(row.get('isSecure')),
+                    http_only=bool(row.get('isHttpOnly')),
+                    persistent=bool(expiry_raw),
+                    has_expires=bool(expiry_raw),
+                    expires_utc=expires,
+                )
+                host = row.get('host') or ''
+                base.url = host.lstrip('.')
+                base.source_item = source_item
+
+                created = copy.copy(base)
+                created.row_type = 'cookie (created)'
+                created.timestamp = creation
+                results.append(created)
+
+                if accessed and accessed not in (creation, zero_ts):
+                    accessed_row = copy.copy(base)
+                    accessed_row.row_type = 'cookie (accessed)'
+                    accessed_row.timestamp = accessed
+                    results.append(accessed_row)
+
+            self.artifacts_counts['Cookies'] = len(results)
+            log.info(f' - Parsed {len(results)} items')
+            self.parsed_artifacts.extend(results)
+        finally:
+            conn.close()
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -221,6 +297,12 @@ class Firefox(WebBrowser):
             self.artifacts_display['Bookmarks'] = 'Bookmark records'
             print((self.format_processing_output(
                 'Bookmark records', self.artifacts_counts.get('Bookmarks', 0))))
+
+        if 'cookies.sqlite' in input_listing:
+            self.get_cookies(self.profile_path, 'cookies.sqlite')
+            self.artifacts_display['Cookies'] = 'Cookie records'
+            print((self.format_processing_output(
+                'Cookie records', self.artifacts_counts.get('Cookies', 0))))
 
         self.parsed_artifacts.sort()
 
