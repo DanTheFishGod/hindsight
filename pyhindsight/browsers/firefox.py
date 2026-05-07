@@ -343,6 +343,76 @@ class Firefox(WebBrowser):
         finally:
             conn.close()
 
+    def get_form_history(self, path, database='formhistory.sqlite'):
+        # moz_formhistory rows are values typed into named form fields.
+        # Firefox 64+ also tracks timesUsed/firstUsed/lastUsed.
+        results = []
+        log.info(f'Form history items from {database}:')
+
+        conn = self._open(path, database)
+        if not conn:
+            return
+
+        try:
+            cursor = conn.cursor()
+            has_usage = False
+            try:
+                cursor.execute("PRAGMA table_info(moz_formhistory)")
+                cols = {r['name'] for r in cursor.fetchall()}
+                has_usage = {'timesUsed', 'firstUsed', 'lastUsed'}.issubset(cols)
+            except Exception:
+                pass
+
+            try:
+                if has_usage:
+                    cursor.execute(
+                        "SELECT fieldname, value, timesUsed, firstUsed, lastUsed "
+                        "FROM moz_formhistory"
+                    )
+                else:
+                    cursor.execute("SELECT fieldname, value FROM moz_formhistory")
+            except Exception as e:
+                log.error(f' - Could not query form history: {e}')
+                self.artifacts_counts[database] = 'Failed'
+                return
+
+            source_item = os.path.relpath(os.path.join(path, database), self.profile_path)
+            for row in cursor:
+                # 'it'/'ts' are internal timestamp-ish fields excluded by the autopsy parser.
+                field = (row.get('fieldname') or '').strip()
+                if field.lower() in ('it', 'ts'):
+                    continue
+
+                if has_usage:
+                    first_used = utils.to_datetime(row.get('firstUsed'), self.timezone)
+                    item = Firefox.AutofillItem(
+                        profile=self.profile_path,
+                        date_created=first_used,
+                        name=field,
+                        value=row.get('value'),
+                        count=row.get('timesUsed'),
+                    )
+                    item.timestamp = first_used
+                else:
+                    item = Firefox.AutofillItem(
+                        profile=self.profile_path,
+                        date_created=None,
+                        name=field,
+                        value=row.get('value'),
+                        count=None,
+                    )
+                    item.timestamp = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
+                item.row_type = 'autofill'
+                item.source_item = source_item
+                results.append(item)
+
+            self.artifacts_counts[database] = len(results)
+            self.artifacts_display['Autofill'] = 'Form history records'
+            log.info(f' - Parsed {len(results)} items')
+            self.parsed_artifacts.extend(results)
+        finally:
+            conn.close()
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -375,6 +445,11 @@ class Firefox(WebBrowser):
             self.artifacts_display['Cookies'] = 'Cookie records'
             print((self.format_processing_output(
                 'Cookie records', self.artifacts_counts.get('Cookies', 0))))
+
+        if 'formhistory.sqlite' in input_listing:
+            self.get_form_history(self.profile_path, 'formhistory.sqlite')
+            print((self.format_processing_output(
+                'Form history records', self.artifacts_counts.get('formhistory.sqlite', 0))))
 
         self.parsed_artifacts.sort()
 
