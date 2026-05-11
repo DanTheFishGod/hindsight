@@ -413,6 +413,83 @@ class Firefox(WebBrowser):
         finally:
             conn.close()
 
+    # moz_perms.permission integer; sourced from nsIPermissionManager.idl.
+    _PERMISSION_VALUES = {
+        0: 'Unknown',
+        1: 'Allow',
+        2: 'Deny',
+        3: 'Prompt',
+        8: 'Allow for session',
+    }
+
+    _EXPIRE_TYPES = {
+        0: 'Never',
+        1: 'At session end',
+        2: 'At a specific time',
+        3: 'Policy-controlled',
+    }
+
+    def get_permissions(self, path, database='permissions.sqlite'):
+        # moz_perms timestamps are unix milliseconds (not PRTime).
+        results = []
+        log.info(f'Permissions items from {database}:')
+
+        conn = self._open(path, database)
+        if not conn:
+            return
+
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT origin, type, permission, expireType, expireTime, "
+                    "       modificationTime "
+                    "FROM moz_perms"
+                )
+            except Exception as e:
+                log.error(f' - Could not query permissions: {e}')
+                self.artifacts_counts[database] = 'Failed'
+                return
+
+            source_item = os.path.relpath(os.path.join(path, database), self.profile_path)
+            for row in cursor:
+                # ms -> PRTime us so to_datetime hits its 16-digit branch.
+                mod_ms = row.get('modificationTime') or 0
+                mod_time = utils.to_datetime(mod_ms * 1000, self.timezone) if mod_ms else \
+                    datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
+
+                perm_value = row.get('permission')
+                perm_label = self._PERMISSION_VALUES.get(perm_value, f'Unknown ({perm_value})')
+                expire_type = row.get('expireType')
+                expire_label = self._EXPIRE_TYPES.get(expire_type, f'Unknown ({expire_type})')
+
+                exp_ms = row.get('expireTime') or 0
+                if expire_type == 2 and exp_ms:
+                    expires = utils.to_datetime(exp_ms * 1000, self.timezone)
+                    interpretation = f'{expire_label}: {expires.isoformat()}'
+                else:
+                    interpretation = expire_label
+
+                item = Firefox.SiteSetting(
+                    profile=self.profile_path,
+                    url=row.get('origin'),
+                    timestamp=mod_time,
+                    key=row.get('type'),
+                    value=perm_label,
+                    interpretation=interpretation,
+                )
+                item.row_type = 'site setting'
+                item.source_item = source_item
+                item.name = row.get('type')
+                item.value = perm_label
+                results.append(item)
+
+            self.artifacts_counts['Permissions'] = len(results)
+            log.info(f' - Parsed {len(results)} items')
+            self.parsed_artifacts.extend(results)
+        finally:
+            conn.close()
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -450,6 +527,12 @@ class Firefox(WebBrowser):
             self.get_form_history(self.profile_path, 'formhistory.sqlite')
             print((self.format_processing_output(
                 'Form history records', self.artifacts_counts.get('formhistory.sqlite', 0))))
+
+        if 'permissions.sqlite' in input_listing:
+            self.get_permissions(self.profile_path, 'permissions.sqlite')
+            self.artifacts_display['Permissions'] = 'Permission records'
+            print((self.format_processing_output(
+                'Permission records', self.artifacts_counts.get('Permissions', 0))))
 
         self.parsed_artifacts.sort()
 
