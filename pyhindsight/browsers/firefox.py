@@ -3,6 +3,7 @@ import copy
 import datetime
 import logging
 import os
+import re
 import urllib.parse
 
 from pyhindsight import utils
@@ -490,6 +491,107 @@ class Firefox(WebBrowser):
         finally:
             conn.close()
 
+    # SiteSecurityServiceState.bin record layout (DataStorage format):
+    # 286-byte fixed slot: hash[0:2], flags[2:4], key[4:260] (ASCII, null-padded,
+    # 2-char persistence prefix + hostname), value[260:] as `<expiry_ms>,<state>,<sub>`.
+    _HSTS_RECORD_SIZE = 286
+    _HSTS_KEY_OFFSET = 4
+    _HSTS_KEY_MAX = 256
+    _HSTS_VALUE_OFFSET = 260
+    _HSTS_VALUE_RE = re.compile(rb'(\d+),(\d+),(\d+)')
+
+    def get_hsts(self, path, filename='SiteSecurityServiceState.bin'):
+        results = []
+        full_path = os.path.join(path, filename)
+        log.info(f'HSTS items from {filename}:')
+        if not os.path.isfile(full_path):
+            log.info(f' - {full_path} not present')
+            return
+
+        try:
+            with open(full_path, 'rb') as fh:
+                blob = fh.read()
+        except OSError as e:
+            log.error(f' - Could not read {full_path}: {e}')
+            self.artifacts_counts['HSTS'] = 'Failed'
+            return
+
+        source_item = os.path.relpath(full_path, self.profile_path)
+        n_records = len(blob) // self._HSTS_RECORD_SIZE
+        for i in range(n_records):
+            rec = blob[i * self._HSTS_RECORD_SIZE:(i + 1) * self._HSTS_RECORD_SIZE]
+
+            key_bytes = rec[self._HSTS_KEY_OFFSET:self._HSTS_KEY_OFFSET + self._HSTS_KEY_MAX]
+            key_bytes = key_bytes.split(b'\x00', 1)[0]
+            if len(key_bytes) < 3:
+                continue
+            try:
+                key_str = key_bytes.decode('ascii')
+            except UnicodeDecodeError:
+                continue
+            # 'P' prefix = persistent-storage bucket holding HSTS pins; skip others.
+            if not key_str or key_str[0] != 'P':
+                continue
+            hostname = key_str[2:] if len(key_str) > 2 else key_str
+
+            value_bytes = rec[self._HSTS_VALUE_OFFSET:]
+            m = self._HSTS_VALUE_RE.search(value_bytes)
+            if not m:
+                continue
+            expiry_ms = int(m.group(1))
+            state = int(m.group(2))
+            include_subdomains = int(m.group(3))
+
+            # state 0 = unset/deleted; skip.
+            if state == 0:
+                continue
+
+            try:
+                expiry_dt = datetime.datetime.fromtimestamp(expiry_ms / 1000.0,
+                                                             datetime.timezone.utc)
+                if self.timezone:
+                    expiry_dt = expiry_dt.astimezone(self.timezone)
+                expiry_str = expiry_dt.isoformat()
+            except (OSError, OverflowError, ValueError):
+                expiry_str = str(expiry_ms)
+
+            interpretation_parts = [f'expires {expiry_str}']
+            if include_subdomains:
+                interpretation_parts.append('includeSubdomains=true')
+            else:
+                interpretation_parts.append('includeSubdomains=false')
+            if state == 2:
+                interpretation_parts.append('state=2 (HSTS via header + includeSubdomains)')
+            else:
+                interpretation_parts.append(f'state={state}')
+
+            # No creation ts in HSTS records; use file mtime as a soft observed-at.
+            try:
+                observed = datetime.datetime.fromtimestamp(
+                    os.path.getmtime(full_path), datetime.timezone.utc)
+                if self.timezone:
+                    observed = observed.astimezone(self.timezone)
+            except OSError:
+                observed = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
+
+            item = Firefox.SiteSetting(
+                profile=self.profile_path,
+                url=hostname,
+                timestamp=observed,
+                key='HSTS',
+                value='Enforced',
+                interpretation='; '.join(interpretation_parts),
+            )
+            item.row_type = 'site setting (HSTS)'
+            item.name = 'HSTS'
+            item.value = 'Enforced'
+            item.source_item = source_item
+            results.append(item)
+
+        self.artifacts_counts['HSTS'] = len(results)
+        log.info(f' - Parsed {len(results)} items')
+        self.parsed_artifacts.extend(results)
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -533,6 +635,12 @@ class Firefox(WebBrowser):
             self.artifacts_display['Permissions'] = 'Permission records'
             print((self.format_processing_output(
                 'Permission records', self.artifacts_counts.get('Permissions', 0))))
+
+        if 'SiteSecurityServiceState.bin' in input_listing:
+            self.get_hsts(self.profile_path, 'SiteSecurityServiceState.bin')
+            self.artifacts_display['HSTS'] = 'HSTS records'
+            print((self.format_processing_output(
+                'HSTS records', self.artifacts_counts.get('HSTS', 0))))
 
         self.parsed_artifacts.sort()
 
