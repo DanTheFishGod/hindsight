@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import copy
 import datetime
+import json
 import logging
 import os
 import re
@@ -30,6 +31,87 @@ FIREFOX_VISIT_TYPES = {
 BOOKMARK_TYPE_URL = 1
 BOOKMARK_TYPE_FOLDER = 2
 BOOKMARK_TYPE_SEPARATOR = 3
+
+# Matches `user_pref("key", value);` lines in prefs.js.
+_PREFS_LINE_RE = re.compile(
+    r'^user_pref\(\s*"([^"]+)"\s*,\s*(.*?)\s*\)\s*;\s*$'
+)
+
+# Forensically interesting Firefox preferences, grouped for the XLSX sheet.
+INTERESTING_PREFS = [
+    ('Identity & Account', [
+        ('services.sync.username', 'Firefox Account email (logged-in user)'),
+        ('services.sync.lastSync', 'Last Firefox Sync time (unix seconds)'),
+        ('services.sync.numClients', 'Number of devices linked to this account'),
+        ('identity.fxaccounts.lastSignedInUserHash', 'Hashed identity of last FxA user'),
+    ]),
+    ('Startup & Homepage', [
+        ('browser.startup.homepage', 'Configured homepage URL(s)'),
+        ('browser.startup.page', 'What to show on startup (1=homepage, 3=last session)'),
+        ('browser.newtabpage.enabled', 'New tab page enabled'),
+        ('browser.startup.lastColdStartupCheck', 'Last cold-start check (unix seconds)'),
+        ('app.installation.timestamp', 'Firefox installation timestamp (PRTime)'),
+    ]),
+    ('Downloads', [
+        ('browser.download.lastDir', 'Last directory used to save a download'),
+        ('browser.download.dir', 'Configured default download directory'),
+        ('browser.download.folderList',
+         'Default download folder type (0=Desktop, 1=Downloads, 2=custom)'),
+        ('browser.download.useDownloadDir', 'Skip the Save As prompt'),
+        ('browser.download.alwaysOpenPanel', 'Always open the downloads panel'),
+    ]),
+    ('Network & Proxy', [
+        ('network.proxy.type',
+         'Proxy mode (0=none, 1=manual, 2=PAC, 4=auto-detect, 5=system)'),
+        ('network.proxy.http', 'Manual HTTP proxy host'),
+        ('network.proxy.http_port', 'Manual HTTP proxy port'),
+        ('network.proxy.ssl', 'Manual HTTPS proxy host'),
+        ('network.proxy.socks', 'Manual SOCKS proxy host'),
+        ('network.proxy.no_proxies_on', 'Domains bypassing the proxy'),
+        ('network.proxy.autoconfig_url', 'PAC file URL'),
+        ('network.trr.mode', 'DNS-over-HTTPS mode'),
+        ('network.trr.uri', 'DNS-over-HTTPS resolver URL'),
+    ]),
+    ('Privacy & Tracking Protection', [
+        ('privacy.donottrackheader.enabled', 'Send Do-Not-Track header'),
+        ('privacy.globalprivacycontrol.enabled', 'Send Global Privacy Control'),
+        ('privacy.trackingprotection.enabled', 'Enhanced Tracking Protection'),
+        ('privacy.history.custom', 'Using custom history settings'),
+        ('privacy.sanitize.sanitizeOnShutdown', 'Clear history on shutdown'),
+        ('privacy.clearOnShutdown.history', 'Clear browsing history on shutdown'),
+        ('privacy.clearOnShutdown.cookies', 'Clear cookies on shutdown'),
+        ('privacy.clearOnShutdown.downloads', 'Clear download list on shutdown'),
+        ('privacy.clearOnShutdown.formdata', 'Clear form data on shutdown'),
+    ]),
+    ('Search & Region', [
+        ('browser.search.region', 'Country code used to pick default engines'),
+        ('browser.search.suggest.enabled', 'Show search suggestions'),
+        ('browser.urlbar.placeholderName', 'Active default search engine name'),
+        ('browser.search.defaultenginename', 'Configured default search engine'),
+        ('browser.search.lastModifiedTopic', 'Last search-config modification (PRTime)'),
+        ('intl.accept_languages', 'Languages sent in HTTP Accept-Language'),
+    ]),
+    ('Passwords & Autofill', [
+        ('signon.rememberSignons', 'Save logins and passwords for websites'),
+        ('signon.management.page.breach-alerts.enabled', 'Show login breach alerts'),
+        ('signon.autofillForms', 'Autofill saved usernames/passwords'),
+        ('browser.formfill.enable', 'Save form entries'),
+        ('extensions.formautofill.addresses.enabled', 'Save and fill addresses'),
+        ('extensions.formautofill.creditCards.enabled', 'Save and fill credit cards'),
+    ]),
+    ('Telemetry & Updates', [
+        ('app.update.auto', 'Apply updates automatically'),
+        ('app.update.background.lastInstalledTaskVersion', 'Last background-update task version'),
+        ('toolkit.telemetry.enabled', 'Send telemetry to Mozilla'),
+        ('datareporting.healthreport.uploadEnabled', 'Send Health Report data'),
+        ('toolkit.telemetry.lastUpdate', 'Last telemetry upload (unix seconds)'),
+    ]),
+    ('Containers & Profiles', [
+        ('privacy.userContext.enabled', 'Container tabs enabled'),
+        ('extensions.installedFromFXA', 'Add-ons installed via FxA'),
+        ('browser.engagement.profileCount', 'Number of profiles on this install'),
+    ]),
+]
 
 
 class Firefox(WebBrowser):
@@ -592,6 +674,100 @@ class Firefox(WebBrowser):
         log.info(f' - Parsed {len(results)} items')
         self.parsed_artifacts.extend(results)
 
+    @staticmethod
+    def _parse_prefs_value(raw):
+        if raw == 'true':
+            return True
+        if raw == 'false':
+            return False
+        if raw == 'null':
+            return None
+        try:
+            return json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+                return raw[1:-1].replace('\\\\', '\\').replace('\\"', '"')
+            return raw
+
+    def get_preferences(self, path, prefs_file='prefs.js'):
+        full_path = os.path.join(path, prefs_file)
+        log.info(f'Preferences from {prefs_file}:')
+        if not os.path.isfile(full_path):
+            log.info(f' - {full_path} not present')
+            return
+
+        all_prefs = {}
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith('//'):
+                        continue
+                    m = _PREFS_LINE_RE.match(line)
+                    if not m:
+                        continue
+                    name = m.group(1)
+                    value = self._parse_prefs_value(m.group(2))
+                    all_prefs[name] = value
+        except OSError as e:
+            log.error(f' - Could not read {full_path}: {e}')
+            self.artifacts_counts['prefs.js'] = 'Failed'
+            return
+
+        results = []
+        seen = set()
+
+        for group_name, entries in INTERESTING_PREFS:
+            results.append({'group': group_name, 'name': None, 'value': None, 'description': None})
+            for key, description in entries:
+                if key in all_prefs:
+                    value = all_prefs[key]
+                    seen.add(key)
+                else:
+                    value = '<not set>'
+                results.append({
+                    'group': None,
+                    'name': key,
+                    'value': value if not isinstance(value, (dict, list)) else json.dumps(value),
+                    'description': description,
+                })
+
+        # Long tail: every other set pref, grouped by dotted prefix.
+        remaining = sorted(k for k in all_prefs if k not in seen)
+        if remaining:
+            results.append({'group': 'All Other Preferences', 'name': None, 'value': None, 'description': None})
+            current_prefix = None
+            for key in remaining:
+                prefix = key.split('.', 1)[0]
+                if prefix != current_prefix:
+                    results.append({
+                        'group': f'{prefix}.*', 'name': None, 'value': None, 'description': None,
+                    })
+                    current_prefix = prefix
+                value = all_prefs[key]
+                results.append({
+                    'group': None,
+                    'name': key,
+                    'value': value if not isinstance(value, (dict, list)) else json.dumps(value),
+                    'description': None,
+                })
+
+        pref_count = sum(1 for r in results if r['name'] is not None)
+        self.artifacts_counts['Preferences'] = pref_count
+
+        profile_folder = os.path.basename(path.rstrip(os.sep)) or 'profile'
+        presentation = {
+            'title': f'Preferences ({profile_folder})',
+            'columns': [
+                {'display_name': 'Group', 'data_name': 'group', 'display_width': 24},
+                {'display_name': 'Setting Name', 'data_name': 'name', 'display_width': 50},
+                {'display_name': 'Value', 'data_name': 'value', 'display_width': 50},
+                {'display_name': 'Description', 'data_name': 'description', 'display_width': 60},
+            ],
+        }
+        self.preferences.append({'data': results, 'presentation': presentation})
+        log.info(f' - Parsed {pref_count} preferences')
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -629,6 +805,12 @@ class Firefox(WebBrowser):
             self.get_form_history(self.profile_path, 'formhistory.sqlite')
             print((self.format_processing_output(
                 'Form history records', self.artifacts_counts.get('formhistory.sqlite', 0))))
+
+        if 'prefs.js' in input_listing:
+            self.get_preferences(self.profile_path, 'prefs.js')
+            self.artifacts_display['Preferences'] = 'Preference items'
+            print((self.format_processing_output(
+                'Preference items', self.artifacts_counts.get('Preferences', 0))))
 
         if 'permissions.sqlite' in input_listing:
             self.get_permissions(self.profile_path, 'permissions.sqlite')
