@@ -768,6 +768,106 @@ class Firefox(WebBrowser):
         self.preferences.append({'data': results, 'presentation': presentation})
         log.info(f' - Parsed {pref_count} preferences')
 
+    def get_logins(self, path, filename='logins.json'):
+        # Username and password values are NSS/3DES-CBC encrypted (key wrapped in key4.db).
+        # We do NOT decrypt; we surface unencrypted metadata + three timestamp rows per login.
+        results = []
+        full_path = os.path.join(path, filename)
+        log.info(f'Saved logins from {filename}:')
+        if not os.path.isfile(full_path):
+            log.info(f' - {full_path} not present')
+            return
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError) as e:
+            log.error(f' - Could not read {full_path}: {e}')
+            self.artifacts_counts['Logins'] = 'Failed'
+            return
+
+        source_item = os.path.relpath(full_path, self.profile_path)
+        zero_ts = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
+
+        for login in data.get('logins', []):
+            hostname = login.get('hostname') or login.get('formSubmitURL') or ''
+            form_url = login.get('formSubmitURL') or ''
+            http_realm = login.get('httpRealm') or ''
+            user_field = login.get('usernameField') or ''
+            pass_field = login.get('passwordField') or ''
+            guid = login.get('guid') or ''
+            times_used = login.get('timesUsed', 0)
+            ever_synced = login.get('everSynced')
+
+            created_ms = login.get('timeCreated') or 0
+            last_used_ms = login.get('timeLastUsed') or 0
+            pw_changed_ms = login.get('timePasswordChanged') or 0
+
+            def _to_dt(ms):
+                if not ms:
+                    return zero_ts
+                return utils.to_datetime(ms * 1000, self.timezone)
+
+            interp_parts = [
+                f'GUID: {guid}',
+                f'usernameField: {user_field!r}',
+                f'passwordField: {pass_field!r}',
+                f'timesUsed: {times_used}',
+            ]
+            if form_url and form_url != hostname:
+                interp_parts.append(f'formSubmitURL: {form_url}')
+            if http_realm:
+                interp_parts.append(f'httpRealm: {http_realm}')
+            if ever_synced is not None:
+                interp_parts.append(f'everSynced: {ever_synced}')
+            interpretation = '; '.join(interp_parts)
+
+            for ts_ms, row_label, ts_name in [
+                (created_ms, 'login (created)', 'timeCreated'),
+                (last_used_ms, 'login (last used)', 'timeLastUsed'),
+                (pw_changed_ms, 'login (password changed)', 'timePasswordChanged'),
+            ]:
+                if not ts_ms:
+                    continue
+                # Drop the duplicate row when the timestamp matches creation.
+                if row_label.endswith('changed)') and ts_ms == created_ms:
+                    continue
+                if row_label.endswith('last used)') and ts_ms == created_ms:
+                    continue
+
+                item = Firefox.LoginItem(
+                    profile=self.profile_path,
+                    date_created=_to_dt(ts_ms),
+                    url=hostname,
+                    name=user_field or '(username field)',
+                    value='<encrypted>',
+                    count=times_used,
+                    interpretation=f'{ts_name}; {interpretation}',
+                )
+                item.row_type = row_label
+                item.timestamp = _to_dt(ts_ms)
+                item.source_item = source_item
+                results.append(item)
+
+        for guid in data.get('potentiallyVulnerablePasswords', []) or []:
+            item = Firefox.LoginItem(
+                profile=self.profile_path,
+                date_created=zero_ts,
+                url='<aggregate>',
+                name='potentiallyVulnerablePassword',
+                value=guid if isinstance(guid, str) else json.dumps(guid),
+                count=None,
+                interpretation='Firefox flagged this saved login GUID as potentially exposed in a known breach',
+            )
+            item.row_type = 'login (vulnerable)'
+            item.timestamp = zero_ts
+            item.source_item = source_item
+            results.append(item)
+
+        self.artifacts_counts['Logins'] = len(results)
+        log.info(f' - Parsed {len(results)} items')
+        self.parsed_artifacts.extend(results)
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -823,6 +923,12 @@ class Firefox(WebBrowser):
             self.artifacts_display['HSTS'] = 'HSTS records'
             print((self.format_processing_output(
                 'HSTS records', self.artifacts_counts.get('HSTS', 0))))
+
+        if 'logins.json' in input_listing:
+            self.get_logins(self.profile_path, 'logins.json')
+            self.artifacts_display['Logins'] = 'Saved login records'
+            print((self.format_processing_output(
+                'Saved login records', self.artifacts_counts.get('Logins', 0))))
 
         self.parsed_artifacts.sort()
 
