@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import struct
 import urllib.parse
 
 from pyhindsight import utils
@@ -867,6 +868,131 @@ class Firefox(WebBrowser):
         self.artifacts_counts['Logins'] = len(results)
         log.info(f' - Parsed {len(results)} items')
         self.parsed_artifacts.extend(results)
+
+    @staticmethod
+    def _snappy_decompress(src):
+        # Snappy "raw" block: varint(decompressed_len) + tag-prefixed literal/copy records.
+        # Pure-Python so we don't take a C-extension dep on python-snappy.
+        n = len(src)
+        i = 0
+        decompressed_len = 0
+        shift = 0
+        while i < n:
+            b = src[i]
+            i += 1
+            decompressed_len |= (b & 0x7F) << shift
+            if not (b & 0x80):
+                break
+            shift += 7
+            if shift >= 32:
+                raise ValueError('snappy: decompressed length varint too long')
+
+        out = bytearray()
+        while i < n and len(out) < decompressed_len:
+            tag = src[i]
+            i += 1
+            tag_type = tag & 0x03
+            if tag_type == 0:
+                # Literal; top 6 bits = length-1 when < 60, else 60..63 = N-59 extra length bytes.
+                length = (tag >> 2) + 1
+                if length > 60:
+                    extra = length - 60
+                    length = 0
+                    for j in range(extra):
+                        length |= src[i + j] << (8 * j)
+                    length += 1
+                    i += extra
+                out += src[i:i + length]
+                i += length
+            elif tag_type == 1:
+                length = ((tag >> 2) & 0x07) + 4
+                offset = ((tag & 0xE0) << 3) | src[i]
+                i += 1
+                for _ in range(length):
+                    out.append(out[-offset])
+            elif tag_type == 2:
+                length = (tag >> 2) + 1
+                offset = src[i] | (src[i + 1] << 8)
+                i += 2
+                for _ in range(length):
+                    out.append(out[-offset])
+            else:
+                length = (tag >> 2) + 1
+                offset = (src[i] | (src[i + 1] << 8) |
+                          (src[i + 2] << 16) | (src[i + 3] << 24))
+                i += 4
+                for _ in range(length):
+                    out.append(out[-offset])
+
+        return bytes(out)
+
+    # 8-byte magic for Mozilla's mozLz40 wrapper: magic + uint32 LE decompressed size + LZ4 block.
+    _MOZLZ4_MAGIC = b'mozLz40\x00'
+
+    @staticmethod
+    def _lz4_block_decompress(src, dest_size):
+        # LZ4 block format: token byte (hi=literal_len, lo=match_len), optional 0xff
+        # overflow chains for both lengths, literal bytes, 2-byte LE match offset.
+        out = bytearray()
+        i = 0
+        n = len(src)
+        while i < n:
+            token = src[i]
+            i += 1
+            literal_len = token >> 4
+            if literal_len == 15:
+                while i < n:
+                    b = src[i]
+                    i += 1
+                    literal_len += b
+                    if b != 0xFF:
+                        break
+            out.extend(src[i:i + literal_len])
+            i += literal_len
+            if i >= n:
+                break
+            if i + 2 > n:
+                break
+            offset = src[i] | (src[i + 1] << 8)
+            i += 2
+            if offset == 0:
+                break
+            match_len = (token & 0x0F) + 4
+            if (token & 0x0F) == 15:
+                while i < n:
+                    b = src[i]
+                    i += 1
+                    match_len += b
+                    if b != 0xFF:
+                        break
+            # Byte-by-byte copy so overlapping windows (RLE-style runs) work.
+            for _ in range(match_len):
+                out.append(out[-offset])
+            if len(out) >= dest_size:
+                break
+        return bytes(out)
+
+    @classmethod
+    def _decompress_jsonlz4(cls, path):
+        try:
+            with open(path, 'rb') as fh:
+                magic = fh.read(8)
+                if magic != cls._MOZLZ4_MAGIC:
+                    log.warning(f' - {path}: not a mozLz40 file (magic={magic!r})')
+                    return None
+                size_bytes = fh.read(4)
+                if len(size_bytes) != 4:
+                    return None
+                dest_size = struct.unpack('<I', size_bytes)[0]
+                payload = fh.read()
+        except OSError as e:
+            log.warning(f' - Could not read {path}: {e}')
+            return None
+        try:
+            return cls._lz4_block_decompress(payload, dest_size)
+        except Exception as e:
+            log.warning(f' - LZ4 decompress failed for {path}: {e}')
+            return None
 
     def process(self):
         try:
