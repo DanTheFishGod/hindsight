@@ -994,6 +994,105 @@ class Firefox(WebBrowser):
             log.warning(f' - LZ4 decompress failed for {path}: {e}')
             return None
 
+    # signedState integers from mozapps/extensions/AddonManager.sys.mjs.
+    _ADDON_SIGNED_STATES = {
+        -2: 'Broken',
+        -1: 'Unknown',
+        0: 'Missing',
+        1: 'Preliminary',
+        2: 'Signed',
+        3: 'System',
+        4: 'Privileged',
+    }
+
+    def get_extensions(self, path, filename='extensions.json'):
+        full_path = os.path.join(path, filename)
+        log.info(f'Installed extensions from {filename}:')
+        if not os.path.isfile(full_path):
+            log.info(f' - {full_path} not present')
+            return
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError) as e:
+            log.error(f' - Could not read {full_path}: {e}')
+            self.artifacts_counts['Extensions'] = 'Failed'
+            return
+
+        results = []
+        for addon in data.get('addons', []):
+            ext_id = addon.get('id') or ''
+            version = addon.get('version') or ''
+            addon_type = addon.get('type') or ''
+            active = addon.get('active')
+            user_disabled = addon.get('userDisabled')
+            app_disabled = addon.get('appDisabled')
+            signed_state_raw = addon.get('signedState')
+            signed_state = self._ADDON_SIGNED_STATES.get(
+                signed_state_raw, f'Unknown ({signed_state_raw})')
+            source_uri = addon.get('sourceURI') or ''
+            location = addon.get('location') or ''
+            on_disk_path = addon.get('path') or ''
+            root_uri = addon.get('rootURI') or ''
+            install_ms = addon.get('installDate') or 0
+            update_ms = addon.get('updateDate') or 0
+
+            default_locale = addon.get('defaultLocale') or {}
+            name = default_locale.get('name') or ext_id
+            description = default_locale.get('description') or ''
+
+            user_perms = addon.get('userPermissions') or {}
+            perms_list = list(user_perms.get('permissions', []))
+            origins_list = list(user_perms.get('origins', []))
+            permissions_str = json.dumps({
+                'permissions': perms_list, 'origins': origins_list
+            }) if (perms_list or origins_list) else ''
+
+            # Compact manifest summary; full extension manifests can be 500KB.
+            manifest_summary = {
+                'id': ext_id,
+                'version': version,
+                'type': addon_type,
+                'active': active,
+                'userDisabled': user_disabled,
+                'appDisabled': app_disabled,
+                'signedState': signed_state,
+                'sourceURI': source_uri,
+                'installLocation': location,
+                'path': on_disk_path,
+                'rootURI': root_uri,
+                'installDate': install_ms,
+                'updateDate': update_ms,
+            }
+
+            results.append(Firefox.BrowserExtension(
+                profile=self.profile_path,
+                ext_id=ext_id,
+                name=name,
+                description=description,
+                version=version,
+                permissions=permissions_str,
+                manifest=json.dumps(manifest_summary),
+            ))
+
+        self.artifacts_counts['Extensions'] = len(results)
+        log.info(f' - Parsed {len(results)} items')
+
+        presentation = {
+            'title': 'Installed Extensions',
+            'columns': [
+                {'display_name': 'Extension Name', 'data_name': 'name', 'display_width': 26},
+                {'display_name': 'Description', 'data_name': 'description', 'display_width': 60},
+                {'display_name': 'Version', 'data_name': 'version', 'display_width': 10},
+                {'display_name': 'App ID', 'data_name': 'ext_id', 'display_width': 40},
+                {'display_name': 'Profile Folder', 'data_name': 'profile', 'display_width': 30},
+                {'display_name': 'Permissions', 'data_name': 'permissions', 'display_width': 45},
+                {'display_name': 'Manifest', 'data_name': 'manifest', 'display_width': 80},
+            ],
+        }
+        self.installed_extensions = {'data': results, 'presentation': presentation}
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -1055,6 +1154,12 @@ class Firefox(WebBrowser):
             self.artifacts_display['Logins'] = 'Saved login records'
             print((self.format_processing_output(
                 'Saved login records', self.artifacts_counts.get('Logins', 0))))
+
+        if 'extensions.json' in input_listing:
+            self.get_extensions(self.profile_path, 'extensions.json')
+            self.artifacts_display['Extensions'] = 'Installed Extensions'
+            print((self.format_processing_output(
+                'Installed Extensions', self.artifacts_counts.get('Extensions', 0))))
 
         self.parsed_artifacts.sort()
 
