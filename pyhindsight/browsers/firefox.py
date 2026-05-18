@@ -1093,6 +1093,145 @@ class Firefox(WebBrowser):
         }
         self.installed_extensions = {'data': results, 'presentation': presentation}
 
+    def _walk_sessionstore(self, doc, source_label, source_item, results):
+        # Emit one SessionItem per navigation entry so the timeline shows tab
+        # history rather than just the currently selected URL.
+        zero_ts = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
+
+        def _emit_entries(entries, window_idx, tab_idx, selected_index,
+                           tab_last_accessed_ms, row_label):
+            for nav_idx, entry in enumerate(entries or []):
+                url = entry.get('url')
+                if not url:
+                    continue
+                title = entry.get('title') or ''
+                referrer = entry.get('referrer') or entry.get('originalURI') or ''
+                # Only the selected nav-entry gets a real timestamp; others sort to epoch 0.
+                if nav_idx + 1 == selected_index and tab_last_accessed_ms:
+                    ts = utils.to_datetime(tab_last_accessed_ms * 1000, self.timezone)
+                else:
+                    ts = zero_ts
+
+                item = Firefox.SessionItem(
+                    profile=self.profile_path,
+                    url=url,
+                    title=title,
+                    timestamp=ts,
+                    session_id=f'win{window_idx}.tab{tab_idx}',
+                    nav_index=nav_idx,
+                    referrer_url=referrer,
+                    original_request_url=entry.get('originalURI'),
+                    source_path=source_item,
+                )
+                item.row_type = row_label
+                item.value = ''
+                item.transition_type = (
+                    'selected' if nav_idx + 1 == selected_index else 'history'
+                )
+                results.append(item)
+
+        for w_idx, window in enumerate(doc.get('windows', []) or []):
+            for t_idx, tab in enumerate(window.get('tabs', []) or []):
+                _emit_entries(
+                    tab.get('entries', []), w_idx, t_idx,
+                    tab.get('index'), tab.get('lastAccessed'),
+                    f'session (open tab, {source_label})')
+
+            for c_idx, closed in enumerate(window.get('_closedTabs', []) or []):
+                state = closed.get('state') or {}
+                ts_ms = closed.get('closedAt')
+                ts = utils.to_datetime(ts_ms * 1000, self.timezone) \
+                    if ts_ms else zero_ts
+                for nav_idx, entry in enumerate(state.get('entries', []) or []):
+                    url = entry.get('url')
+                    if not url:
+                        continue
+                    item = Firefox.SessionItem(
+                        profile=self.profile_path,
+                        url=url,
+                        title=entry.get('title') or '',
+                        timestamp=ts,
+                        session_id=f'win{w_idx}.closed{c_idx}',
+                        nav_index=nav_idx,
+                        referrer_url=entry.get('referrer') or '',
+                        original_request_url=entry.get('originalURI'),
+                        source_path=source_item,
+                    )
+                    item.row_type = f'session (closed tab, {source_label})'
+                    item.value = ''
+                    item.transition_type = 'closed'
+                    results.append(item)
+
+        for cw_idx, cwin in enumerate(doc.get('_closedWindows', []) or []):
+            for t_idx, tab in enumerate(cwin.get('tabs', []) or []):
+                ts_ms = tab.get('lastAccessed')
+                ts = utils.to_datetime(ts_ms * 1000, self.timezone) \
+                    if ts_ms else zero_ts
+                for nav_idx, entry in enumerate(tab.get('entries', []) or []):
+                    url = entry.get('url')
+                    if not url:
+                        continue
+                    item = Firefox.SessionItem(
+                        profile=self.profile_path,
+                        url=url,
+                        title=entry.get('title') or '',
+                        timestamp=ts,
+                        session_id=f'closedwin{cw_idx}.tab{t_idx}',
+                        nav_index=nav_idx,
+                        referrer_url=entry.get('referrer') or '',
+                        original_request_url=entry.get('originalURI'),
+                        source_path=source_item,
+                    )
+                    item.row_type = f'session (closed window, {source_label})'
+                    item.value = ''
+                    item.transition_type = 'closed'
+                    results.append(item)
+
+    def get_sessionstore(self, path):
+        # sessionstore-backups/ rotates: recovery.jsonlz4 (live), recovery.baklz4
+        # (previous live), previous.jsonlz4 (last clean close), upgrade.jsonlz4-<ts>
+        # (per-upgrade snapshot, often preserves state from older Firefox versions).
+        results = []
+        log.info('Sessionstore items:')
+
+        candidates = []
+        primary = os.path.join(path, 'sessionstore.jsonlz4')
+        if os.path.isfile(primary):
+            candidates.append((primary, 'current'))
+
+        backups_dir = os.path.join(path, 'sessionstore-backups')
+        if os.path.isdir(backups_dir):
+            for name in sorted(os.listdir(backups_dir)):
+                full = os.path.join(backups_dir, name)
+                if not os.path.isfile(full):
+                    continue
+                if not (name.endswith('.jsonlz4') or name.endswith('.baklz4')
+                        or '.jsonlz4-' in name):
+                    continue
+                candidates.append((full, name))
+
+        if not candidates:
+            log.info(' - No sessionstore files found')
+            return
+
+        for full_path, label in candidates:
+            try:
+                raw = self._decompress_jsonlz4(full_path)
+                if raw is None:
+                    continue
+                doc = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                log.warning(f' - Could not parse {full_path}: {e}')
+                continue
+            source_item = os.path.relpath(full_path, self.profile_path)
+            before = len(results)
+            self._walk_sessionstore(doc, label, source_item, results)
+            log.info(f' - {label}: parsed {len(results) - before} entries')
+
+        self.artifacts_counts['Sessions'] = len(results)
+        log.info(f' - Parsed {len(results)} items total')
+        self.parsed_artifacts.extend(results)
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -1160,6 +1299,12 @@ class Firefox(WebBrowser):
             self.artifacts_display['Extensions'] = 'Installed Extensions'
             print((self.format_processing_output(
                 'Installed Extensions', self.artifacts_counts.get('Extensions', 0))))
+
+        if 'sessionstore.jsonlz4' in input_listing or 'sessionstore-backups' in input_listing:
+            self.get_sessionstore(self.profile_path)
+            self.artifacts_display['Sessions'] = 'Session (tab) records'
+            print((self.format_processing_output(
+                'Session (tab) records', self.artifacts_counts.get('Sessions', 0))))
 
         self.parsed_artifacts.sort()
 
