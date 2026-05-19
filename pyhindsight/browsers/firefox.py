@@ -1232,6 +1232,83 @@ class Firefox(WebBrowser):
         log.info(f' - Parsed {len(results)} items total')
         self.parsed_artifacts.extend(results)
 
+    def get_bookmark_backups(self, path):
+        # Firefox writes a fresh jsonlz4 snapshot of the bookmark tree daily and
+        # keeps ~10 rolling backups; deleted bookmarks survive in older snapshots.
+        backups_dir = os.path.join(path, 'bookmarkbackups')
+        log.info('Bookmark backups:')
+        if not os.path.isdir(backups_dir):
+            log.info(f' - {backups_dir} not present')
+            return
+
+        zero_ts = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
+        results = []
+
+        def _walk(node, parent_title, snapshot_label, source_item):
+            type_code = node.get('typeCode')
+            title = node.get('title') or ''
+            date_added = node.get('dateAdded') or 0
+            last_modified = node.get('lastModified') or date_added
+            ts = utils.to_datetime(date_added, self.timezone) if date_added else zero_ts
+            mod_ts = utils.to_datetime(last_modified, self.timezone) if last_modified else ts
+
+            if type_code == 1:
+                url = node.get('uri') or node.get('url') or ''
+                item = Firefox.BookmarkItem(
+                    profile=self.profile_path,
+                    date_added=ts,
+                    name=title,
+                    url=url,
+                    parent_folder=parent_title,
+                )
+                item.row_type = f'bookmark (backup, {snapshot_label})'
+                item.source_item = source_item
+                results.append(item)
+            elif type_code == 2:
+                # Skip the synthetic top-level roots (parent_title empty for menu/toolbar/etc).
+                if parent_title:
+                    item = Firefox.BookmarkFolderItem(
+                        profile=self.profile_path,
+                        date_added=ts,
+                        date_modified=mod_ts,
+                        name=title,
+                        parent_folder=parent_title,
+                    )
+                    item.row_type = f'bookmark folder (backup, {snapshot_label})'
+                    item.source_item = source_item
+                    results.append(item)
+                next_parent = title or parent_title
+                for child in node.get('children', []) or []:
+                    _walk(child, next_parent, snapshot_label, source_item)
+
+        for name in sorted(os.listdir(backups_dir)):
+            full = os.path.join(backups_dir, name)
+            if not (name.endswith('.jsonlz4') or name.endswith('.json')):
+                continue
+            if not os.path.isfile(full):
+                continue
+            try:
+                if name.endswith('.jsonlz4'):
+                    raw = self._decompress_jsonlz4(full)
+                    if raw is None:
+                        continue
+                    doc = json.loads(raw)
+                else:
+                    with open(full, 'r', encoding='utf-8', errors='replace') as fh:
+                        doc = json.load(fh)
+            except (json.JSONDecodeError, OSError) as e:
+                log.warning(f' - Could not parse {full}: {e}')
+                continue
+            source_item = os.path.relpath(full, self.profile_path)
+            before = len(results)
+            for child in doc.get('children', []) or []:
+                _walk(child, '', name, source_item)
+            log.info(f' - {name}: {len(results) - before} entries')
+
+        self.artifacts_counts['Bookmark Backups'] = len(results)
+        log.info(f' - Parsed {len(results)} items total')
+        self.parsed_artifacts.extend(results)
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -1305,6 +1382,12 @@ class Firefox(WebBrowser):
             self.artifacts_display['Sessions'] = 'Session (tab) records'
             print((self.format_processing_output(
                 'Session (tab) records', self.artifacts_counts.get('Sessions', 0))))
+
+        if 'bookmarkbackups' in input_listing:
+            self.get_bookmark_backups(self.profile_path)
+            self.artifacts_display['Bookmark Backups'] = 'Bookmark backup records'
+            print((self.format_processing_output(
+                'Bookmark backup records', self.artifacts_counts.get('Bookmark Backups', 0))))
 
         self.parsed_artifacts.sort()
 
