@@ -1378,6 +1378,127 @@ class Firefox(WebBrowser):
         finally:
             conn.close()
 
+    # bounce-tracking-protection.sqlite.sites.entryType from BounceTrackingProtectionStorage.sys.mjs.
+    _BOUNCE_ENTRY_TYPES = {
+        0: 'User activation',
+        1: 'Bounce tracker',
+    }
+
+    # protections.sqlite.events.type from the content-blocking telemetry categories.
+    _PROTECTION_EVENT_TYPES = {
+        1: 'Tracking content',
+        2: 'Tracking cookie',
+        3: 'Fingerprinter',
+        4: 'Cryptominer',
+        5: 'Social tracker',
+    }
+
+    def get_bounce_tracking(self, path, database='bounce-tracking-protection.sqlite'):
+        results = []
+        log.info(f'Bounce tracking items from {database}:')
+
+        conn = self._open(path, database)
+        if not conn:
+            return
+
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT originAttributeSuffix, siteHost, entryType, timeStamp "
+                    "FROM sites"
+                )
+            except Exception as e:
+                log.error(f' - Could not query bounce-tracking state: {e}')
+                self.artifacts_counts[database] = 'Failed'
+                return
+
+            source_item = os.path.relpath(os.path.join(path, database), self.profile_path)
+            for row in cursor:
+                ts = utils.to_datetime(row.get('timeStamp'), self.timezone)
+                entry_type = row.get('entryType')
+                entry_label = self._BOUNCE_ENTRY_TYPES.get(
+                    entry_type, f'Unknown ({entry_type})')
+                origin_suffix = row.get('originAttributeSuffix') or ''
+                interp_parts = [f'entryType={entry_label}']
+                if origin_suffix:
+                    interp_parts.append(f'originAttributeSuffix={origin_suffix}')
+
+                item = Firefox.SiteSetting(
+                    profile=self.profile_path,
+                    url=row.get('siteHost'),
+                    timestamp=ts,
+                    key='bounce-tracking',
+                    value=entry_label,
+                    interpretation='; '.join(interp_parts),
+                )
+                item.row_type = 'site setting (bounce tracking)'
+                item.name = 'bounce-tracking'
+                item.value = entry_label
+                item.source_item = source_item
+                results.append(item)
+
+            self.artifacts_counts['Bounce Tracking'] = len(results)
+            log.info(f' - Parsed {len(results)} items')
+            self.parsed_artifacts.extend(results)
+        finally:
+            conn.close()
+
+    def get_content_blocking(self, path, database='protections.sqlite'):
+        # Aggregate daily counters: (date, category, count).
+        results = []
+        log.info(f'Content-blocking items from {database}:')
+
+        conn = self._open(path, database)
+        if not conn:
+            return
+
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("SELECT type, count, timestamp FROM events")
+            except Exception as e:
+                log.error(f' - Could not query content-blocking events: {e}')
+                self.artifacts_counts[database] = 'Failed'
+                return
+
+            source_item = os.path.relpath(os.path.join(path, database), self.profile_path)
+            for row in cursor:
+                # `timestamp` is a TEXT date like '2025-09-15'.
+                ts_raw = row.get('timestamp') or ''
+                try:
+                    ts = datetime.datetime.strptime(ts_raw, '%Y-%m-%d').replace(
+                        tzinfo=datetime.timezone.utc)
+                    if self.timezone:
+                        ts = ts.astimezone(self.timezone)
+                except (ValueError, TypeError):
+                    ts = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
+
+                type_int = row.get('type')
+                type_label = self._PROTECTION_EVENT_TYPES.get(
+                    type_int, f'Unknown ({type_int})')
+                count = row.get('count') or 0
+
+                item = Firefox.SiteSetting(
+                    profile=self.profile_path,
+                    url='<aggregate daily counter>',
+                    timestamp=ts,
+                    key='content-blocking',
+                    value=f'{type_label} blocked: {count}',
+                    interpretation=f'On {ts_raw}, Firefox blocked {count} {type_label.lower()}(s) sitewide',
+                )
+                item.row_type = 'site setting (content blocking)'
+                item.name = 'content-blocking'
+                item.value = f'{type_label} blocked: {count}'
+                item.source_item = source_item
+                results.append(item)
+
+            self.artifacts_counts['Content Blocking'] = len(results)
+            log.info(f' - Parsed {len(results)} items')
+            self.parsed_artifacts.extend(results)
+        finally:
+            conn.close()
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -1463,6 +1584,19 @@ class Firefox(WebBrowser):
             self.artifacts_display['Favicons'] = 'Favicon-derived URL records'
             print((self.format_processing_output(
                 'Favicon-derived URL records', self.artifacts_counts.get('Favicons', 0))))
+
+        if 'bounce-tracking-protection.sqlite' in input_listing:
+            self.get_bounce_tracking(self.profile_path, 'bounce-tracking-protection.sqlite')
+            self.artifacts_display['Bounce Tracking'] = 'Bounce-tracking records'
+            print((self.format_processing_output(
+                'Bounce-tracking records', self.artifacts_counts.get('Bounce Tracking', 0))))
+
+        if 'protections.sqlite' in input_listing:
+            self.get_content_blocking(self.profile_path, 'protections.sqlite')
+            self.artifacts_display['Content Blocking'] = 'Content-blocking event records'
+            print((self.format_processing_output(
+                'Content-blocking event records',
+                self.artifacts_counts.get('Content Blocking', 0))))
 
         self.parsed_artifacts.sort()
 
