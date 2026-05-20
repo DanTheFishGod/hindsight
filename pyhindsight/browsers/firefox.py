@@ -1309,6 +1309,75 @@ class Firefox(WebBrowser):
         log.info(f' - Parsed {len(results)} items total')
         self.parsed_artifacts.extend(results)
 
+    def get_favicons(self, path, database='favicons.sqlite'):
+        # favicons.sqlite survives 'Clear History' on places.sqlite, so pages
+        # appear here even after the user wiped them from history.
+        results = []
+        log.info(f'Favicon items from {database}:')
+
+        conn = self._open(path, database)
+        if not conn:
+            return
+
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT p.page_url, i.icon_url, i.width, i.expire_ms "
+                    "FROM moz_pages_w_icons p "
+                    "JOIN moz_icons_to_pages m ON p.id = m.page_id "
+                    "JOIN moz_icons i ON i.id = m.icon_id"
+                )
+            except Exception as e:
+                log.error(f' - Could not query favicons: {e}')
+                self.artifacts_counts[database] = 'Failed'
+                return
+
+            source_item = os.path.relpath(os.path.join(path, database), self.profile_path)
+            zero_ts = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
+
+            for row in cursor:
+                expire_ms = row.get('expire_ms') or 0
+                if expire_ms:
+                    expire_dt = utils.to_datetime(expire_ms * 1000, self.timezone)
+                else:
+                    expire_dt = zero_ts
+
+                icon_url = row.get('icon_url') or ''
+                width = row.get('width') or 0
+                # 'fake-favicon-uri:' is Firefox-synthetic; no forensic value.
+                if icon_url.startswith('fake-favicon-uri:'):
+                    continue
+
+                item = Firefox.URLItem(
+                    profile=self.profile_path,
+                    visit_id=None,
+                    url=row.get('page_url'),
+                    title=None,
+                    visit_time=expire_dt,
+                    last_visit_time=expire_dt,
+                    visit_count=None,
+                    typed_count=None,
+                    from_visit=None,
+                    transition=None,
+                    hidden=None,
+                    favicon_id=None,
+                )
+                item.row_type = 'url (from favicons)'
+                item.transition_friendly = 'Recovered from favicons cache'
+                item.interpretation = (
+                    f'Icon: {icon_url} ({width}px); page survived in '
+                    f'favicons.sqlite (history may have been cleared)'
+                )
+                item.source_item = source_item
+                results.append(item)
+
+            self.artifacts_counts['Favicons'] = len(results)
+            log.info(f' - Parsed {len(results)} items')
+            self.parsed_artifacts.extend(results)
+        finally:
+            conn.close()
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -1388,6 +1457,12 @@ class Firefox(WebBrowser):
             self.artifacts_display['Bookmark Backups'] = 'Bookmark backup records'
             print((self.format_processing_output(
                 'Bookmark backup records', self.artifacts_counts.get('Bookmark Backups', 0))))
+
+        if 'favicons.sqlite' in input_listing:
+            self.get_favicons(self.profile_path, 'favicons.sqlite')
+            self.artifacts_display['Favicons'] = 'Favicon-derived URL records'
+            print((self.format_processing_output(
+                'Favicon-derived URL records', self.artifacts_counts.get('Favicons', 0))))
 
         self.parsed_artifacts.sort()
 
