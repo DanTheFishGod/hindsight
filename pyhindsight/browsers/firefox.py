@@ -1625,6 +1625,120 @@ class Firefox(WebBrowser):
             'headers': headers,
         }
 
+    def _resolve_cache_dir(self):
+        # Resolution order: user-supplied --cache, profile-adjacent cache2/entries,
+        # then OS-specific fallbacks since Firefox splits cache out of the profile
+        # on Windows (%LOCALAPPDATA%) and macOS (~/Library/Caches).
+        def _entries_under(p):
+            if not p or not os.path.isdir(p):
+                return None
+            base = os.path.basename(p.rstrip(os.sep)).lower()
+            if base == 'entries':
+                return p
+            if base == 'cache2':
+                cand = os.path.join(p, 'entries')
+                return cand if os.path.isdir(cand) else None
+            cand = os.path.join(p, 'cache2', 'entries')
+            return cand if os.path.isdir(cand) else None
+
+        cand = _entries_under(self.cache_path)
+        if cand:
+            return cand
+
+        cand = _entries_under(self.profile_path)
+        if cand:
+            return cand
+
+        # Windows: %APPDATA%\Mozilla\Firefox -> %LOCALAPPDATA%\Mozilla\Firefox
+        norm = self.profile_path.replace('/', os.sep)
+        lower = norm.lower()
+        if '\\roaming\\mozilla\\firefox\\' in lower:
+            local = re.sub(r'\\Roaming\\Mozilla\\Firefox\\',
+                           r'\\Local\\Mozilla\\Firefox\\', norm, count=1, flags=re.IGNORECASE)
+            cand = _entries_under(local)
+            if cand:
+                log.info(f' - Auto-detected Firefox cache at {cand}')
+                return cand
+
+        # macOS: ~/Library/Application Support/Firefox -> ~/Library/Caches/Firefox
+        if '/Library/Application Support/Firefox/' in self.profile_path:
+            mac = self.profile_path.replace(
+                '/Library/Application Support/Firefox/',
+                '/Library/Caches/Firefox/', 1)
+            cand = _entries_under(mac)
+            if cand:
+                log.info(f' - Auto-detected Firefox cache at {cand}')
+                return cand
+
+        return None
+
+    def get_cache(self, cache_entries_dir):
+        results = []
+        log.info(f'Cache items from {cache_entries_dir}:')
+
+        try:
+            names = os.listdir(cache_entries_dir)
+        except OSError as e:
+            log.error(f' - Could not read cache directory: {e}')
+            self.artifacts_counts['Cache'] = 'Failed'
+            return
+
+        source_item = os.path.relpath(cache_entries_dir, self.profile_path) \
+            if cache_entries_dir.startswith(self.profile_path) else cache_entries_dir
+        skipped = 0
+        for name in names:
+            path = os.path.join(cache_entries_dir, name)
+            if not os.path.isfile(path):
+                continue
+            parsed = self._parse_cache2_entry(path)
+            if parsed is None:
+                skipped += 1
+                continue
+
+            try:
+                request_time = datetime.datetime.fromtimestamp(
+                    parsed['last_fetched'], datetime.timezone.utc)
+                if self.timezone:
+                    request_time = request_time.astimezone(self.timezone)
+            except (OSError, OverflowError, ValueError):
+                request_time = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
+
+            content_type = parsed['headers'].get('content-type')
+            data_size = parsed['data_size']
+            if content_type and data_size:
+                data_summary = f'{content_type} ({data_size} bytes)'
+            elif content_type:
+                data_summary = f'{content_type}'
+            elif data_size:
+                data_summary = f'{data_size} bytes'
+            else:
+                data_summary = '<no data>'
+
+            item = Firefox.CacheItem(
+                profile=self.profile_path,
+                url=parsed['url'],
+                title=None,
+                request_time=request_time,
+                locations=name,
+                key=parsed['key'],
+                metadata=None,
+                data=None,
+            )
+            item.row_type = 'cache'
+            item.data_summary = data_summary
+            item.http_headers_str = str(parsed['headers']) if parsed['headers'] else ''
+            item.etag = parsed['headers'].get('etag', '') or ''
+            item.last_modified = parsed['headers'].get('last-modified', '') or ''
+            item.source_item = source_item
+            results.append(item)
+
+        if skipped:
+            log.info(f' - Skipped {skipped} unparseable files in cache directory')
+
+        self.artifacts_counts['Cache'] = len(results)
+        log.info(f' - Parsed {len(results)} items')
+        self.parsed_artifacts.extend(results)
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -1723,6 +1837,15 @@ class Firefox(WebBrowser):
             print((self.format_processing_output(
                 'Content-blocking event records',
                 self.artifacts_counts.get('Content Blocking', 0))))
+
+        cache_dir = self._resolve_cache_dir()
+        if cache_dir:
+            self.get_cache(cache_dir)
+            self.artifacts_display['Cache'] = 'Cache records'
+            print((self.format_processing_output(
+                'Cache records', self.artifacts_counts.get('Cache', 0))))
+        else:
+            log.info('No Firefox cache2 directory found; skipping cache parse.')
 
         self.parsed_artifacts.sort()
 
