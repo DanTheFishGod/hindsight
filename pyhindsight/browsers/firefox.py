@@ -33,6 +33,18 @@ BOOKMARK_TYPE_URL = 1
 BOOKMARK_TYPE_FOLDER = 2
 BOOKMARK_TYPE_SEPARATOR = 3
 
+# cache2 entry layout (see CacheFileMetadata.h in mozilla-central). Body is
+# divided into 256 KiB chunks with a uint16 hash per chunk written between
+# the body and the metadata block; the file ends with a uint32 offset to the
+# start of the metadata block.
+CACHE2_CHUNK_SIZE = 256 * 1024
+CACHE2_HASH_SIZE = 2
+CACHE2_MIN_ENTRY_SIZE = 41  # 4 hash + 32 header + 1 key + null + 4 offset
+
+# Firefox cache keys look like `O^partitionKey=%28...%29,:https://www.example.com/...`;
+# the URL is the trailing scheme://... segment.
+_CACHE2_URL_RE = re.compile(rb'(https?://[^\x00]+)$')
+
 # Matches `user_pref("key", value);` lines in prefs.js.
 _PREFS_LINE_RE = re.compile(
     r'^user_pref\(\s*"([^"]+)"\s*,\s*(.*?)\s*\)\s*;\s*$'
@@ -1498,6 +1510,120 @@ class Firefox(WebBrowser):
             self.parsed_artifacts.extend(results)
         finally:
             conn.close()
+
+    @staticmethod
+    def _parse_cache2_entry(path):
+        # Layout (big-endian throughout):
+        #   [body, length=meta_offset] [chunk_hashes, 2B per CHUNK_SIZE chunk]
+        #   [metadata block] [uint32 meta_offset trailer]
+        # Metadata block: u32 crc | u32 version | u32 fetch_count | u32 last_fetched
+        #   | u32 last_modified | u32 frecency | u32 expiration | u32 key_size
+        #   | u32 flags (v2+) | key[key_size] | 0x00 | (name\0value\0)* elements
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return None
+        if size < CACHE2_MIN_ENTRY_SIZE:
+            return None
+
+        try:
+            with open(path, 'rb') as fh:
+                # Multi-MB entries: seek to the metadata block instead of slurping
+                # gigabytes of cached video into memory.
+                if size <= 4 * 1024 * 1024:
+                    buf = fh.read()
+                    meta_offset = struct.unpack('>I', buf[-4:])[0]
+                    if meta_offset >= size - 4:
+                        return None
+                    n_chunks = (meta_offset + CACHE2_CHUNK_SIZE - 1) // CACHE2_CHUNK_SIZE if meta_offset else 0
+                    meta_start = meta_offset + n_chunks * CACHE2_HASH_SIZE
+                    meta_block = buf[meta_start:-4]
+                else:
+                    fh.seek(-4, os.SEEK_END)
+                    meta_offset = struct.unpack('>I', fh.read(4))[0]
+                    if meta_offset >= size - 4:
+                        return None
+                    n_chunks = (meta_offset + CACHE2_CHUNK_SIZE - 1) // CACHE2_CHUNK_SIZE if meta_offset else 0
+                    meta_start = meta_offset + n_chunks * CACHE2_HASH_SIZE
+                    meta_len = size - meta_start - 4
+                    if meta_len <= 0 or meta_len > 64 * 1024 * 1024:
+                        return None
+                    fh.seek(meta_start)
+                    meta_block = fh.read(meta_len)
+        except (OSError, struct.error):
+            return None
+
+        if len(meta_block) < 32:
+            return None
+
+        hdr = meta_block[4:]  # drop leading u32 CRC
+        if len(hdr) < 28:
+            return None
+        try:
+            version, fetch_count, last_fetched, last_modified, frecency, expiration, key_size = \
+                struct.unpack('>IIIIIII', hdr[:28])
+        except struct.error:
+            return None
+
+        if version >= 2:
+            if len(hdr) < 32:
+                return None
+            flags = struct.unpack('>I', hdr[28:32])[0]
+            header_size = 32
+        else:
+            flags = None
+            header_size = 28
+
+        if key_size == 0 or key_size > 64 * 1024:
+            return None
+        if header_size + key_size + 1 > len(hdr):
+            return None
+
+        key_bytes = hdr[header_size:header_size + key_size]
+        elements_blob = hdr[header_size + key_size + 1:]
+
+        m = _CACHE2_URL_RE.search(key_bytes)
+        url = m.group(1).decode('utf-8', errors='replace') if m else \
+            key_bytes.decode('utf-8', errors='replace')
+
+        elements = {}
+        parts = elements_blob.split(b'\x00')
+        i = 0
+        while i + 1 < len(parts):
+            name = parts[i].decode('utf-8', errors='replace')
+            value = parts[i + 1].decode('utf-8', errors='replace')
+            if name:
+                elements[name] = value
+            i += 2
+
+        response_head = elements.get('response-head') or elements.get('original-response-headers') or ''
+        status_line = None
+        headers = {}
+        if response_head:
+            lines = response_head.replace('\r\n', '\n').split('\n')
+            status_line = lines[0].strip() if lines else None
+            for line in lines[1:]:
+                if ':' not in line:
+                    continue
+                name, _, value = line.partition(':')
+                if name.strip():
+                    headers[name.strip().lower()] = value.strip()
+
+        return {
+            'data_size': meta_offset,
+            'version': version,
+            'fetch_count': fetch_count,
+            'last_fetched': last_fetched,
+            'last_modified': last_modified,
+            'frecency': frecency,
+            'expiration': expiration if expiration else None,
+            'flags': flags,
+            'key': key_bytes.decode('utf-8', errors='replace'),
+            'url': url,
+            'elements': elements,
+            'status_line': status_line,
+            'headers': headers,
+        }
 
     def process(self):
         try:
