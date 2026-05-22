@@ -1739,6 +1739,142 @@ class Firefox(WebBrowser):
         log.info(f' - Parsed {len(results)} items')
         self.parsed_artifacts.extend(results)
 
+    @staticmethod
+    def _decode_origin_folder(name):
+        # Firefox encodes origins as `https+++host`, `http+++host+port`, etc.
+        # We only need a readable approximation; the canonical origin is
+        # available from the `database` table inside the SQLite file.
+        if '+++' in name:
+            scheme, rest = name.split('+++', 1)
+            rest = rest.replace('+', ':')
+            return f'{scheme}://{rest}'
+        return name
+
+    def _decode_ls_value(self, raw, conversion_type, compression_type, source_path):
+        # compression_type=1: snappy-compressed value blob.
+        # conversion_type=0: real UTF-16-LE; =1: narrow (Latin-1, 1 byte per UTF-16 code unit).
+        data = bytes(raw) if raw is not None else b''
+
+        if compression_type == 1:
+            try:
+                data = self._snappy_decompress(data)
+            except Exception as e:
+                log.debug(f'localStorage snappy decompress failed for {source_path}: {e}')
+                return f'<snappy decompression failed: {len(data)} bytes>'
+
+        try:
+            if conversion_type == 0:
+                return data.decode('utf-16-le')
+            return data.decode('utf-8')
+        except UnicodeDecodeError:
+            return data.decode('utf-8', errors='replace')
+
+    def get_local_storage(self, path):
+        storage_root = os.path.join(path, 'storage', 'default')
+        log.info(f'localStorage from {storage_root}:')
+        if not os.path.isdir(storage_root):
+            log.info(' - storage/default not present')
+            return
+
+        results = []
+        origins_seen = 0
+        origins_with_data = 0
+        decode_failures = 0
+
+        for origin_folder in sorted(os.listdir(storage_root)):
+            ls_dir = os.path.join(storage_root, origin_folder, 'ls')
+            ls_db = os.path.join(ls_dir, 'data.sqlite')
+            if not os.path.isfile(ls_db):
+                continue
+            origins_seen += 1
+
+            conn = utils.open_sqlite_db(self, ls_dir, 'data.sqlite')
+            if not conn:
+                continue
+
+            try:
+                cursor = conn.cursor()
+                origin = self._decode_origin_folder(origin_folder)
+                try:
+                    cursor.execute('SELECT origin FROM database LIMIT 1')
+                    row = cursor.fetchone()
+                    if row and row.get('origin'):
+                        origin = row['origin']
+                except Exception:
+                    pass
+
+                try:
+                    cursor.execute(
+                        "SELECT key, utf16_length, conversion_type, "
+                        "       compression_type, last_access_time, value "
+                        "FROM data"
+                    )
+                except Exception as e:
+                    log.debug(f' - {origin_folder}: data table unreadable ({e})')
+                    continue
+
+                source_path = os.path.relpath(ls_db, self.profile_path)
+                got_any = False
+                for seq, row in enumerate(cursor):
+                    key = row.get('key') or ''
+                    conv = row.get('conversion_type') or 0
+                    comp = row.get('compression_type') or 0
+                    raw_value = row.get('value')
+                    try:
+                        value = self._decode_ls_value(
+                            raw_value, conv, comp, source_path)
+                    except Exception as e:
+                        log.debug(f' - decode failed in {origin_folder}/{key}: {e}')
+                        decode_failures += 1
+                        continue
+
+                    last_access_raw = row.get('last_access_time') or 0
+                    if last_access_raw:
+                        last_modified = utils.to_datetime(
+                            last_access_raw, self.timezone)
+                    else:
+                        # last_access_time=0 is common; fall back to file mtime.
+                        try:
+                            last_modified = datetime.datetime.fromtimestamp(
+                                os.path.getmtime(ls_db), datetime.timezone.utc)
+                            if self.timezone:
+                                last_modified = last_modified.astimezone(
+                                    self.timezone)
+                        except OSError:
+                            last_modified = None
+
+                    item = Firefox.LocalStorageItem(
+                        profile=self.profile_path,
+                        origin=origin,
+                        key=key,
+                        value=value,
+                        seq=seq,
+                        state='Live',
+                        source_path=source_path,
+                        last_modified=last_modified,
+                    )
+                    results.append(item)
+                    got_any = True
+
+                if got_any:
+                    origins_with_data += 1
+            finally:
+                conn.close()
+
+        self.artifacts_counts['Local Storage'] = len(results)
+        if decode_failures:
+            log.info(
+                f' - Parsed {len(results)} records from {origins_with_data} '
+                f'origins ({origins_seen} scanned, {decode_failures} decode '
+                f'failures)'
+            )
+        else:
+            log.info(
+                f' - Parsed {len(results)} records from {origins_with_data} '
+                f'origins ({origins_seen} scanned)'
+            )
+        self.parsed_storage.extend(results)
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -1837,6 +1973,13 @@ class Firefox(WebBrowser):
             print((self.format_processing_output(
                 'Content-blocking event records',
                 self.artifacts_counts.get('Content Blocking', 0))))
+
+        if 'storage' in input_listing and os.path.isdir(
+                os.path.join(self.profile_path, 'storage', 'default')):
+            self.get_local_storage(self.profile_path)
+            self.artifacts_display['Local Storage'] = 'Local Storage records'
+            print((self.format_processing_output(
+                'Local Storage records', self.artifacts_counts.get('Local Storage', 0))))
 
         cache_dir = self._resolve_cache_dir()
         if cache_dir:
