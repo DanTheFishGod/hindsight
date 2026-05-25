@@ -1875,6 +1875,424 @@ class Firefox(WebBrowser):
             )
         self.parsed_storage.extend(results)
 
+    # SCTAG values from mozilla-central/js/src/vm/StructuredClone.cpp StructuredDataType.
+    # Tags below SCTAG_HEADER (0xFFF10000) are doubles encoded as their 64-bit IEEE bits.
+    _SC_HEADER = 0xFFF10000
+    _SC_NULL = 0xFFFF0000
+    _SC_UNDEFINED = 0xFFFF0001
+    _SC_BOOLEAN = 0xFFFF0002
+    _SC_INT32 = 0xFFFF0003
+    _SC_STRING = 0xFFFF0004
+    _SC_DATE_OBJECT = 0xFFFF0005
+    _SC_REGEXP_OBJECT = 0xFFFF0006
+    _SC_ARRAY_OBJECT = 0xFFFF0007
+    _SC_OBJECT_OBJECT = 0xFFFF0008
+    _SC_ARRAY_BUFFER_V2 = 0xFFFF0009
+    _SC_BOOLEAN_OBJECT = 0xFFFF000A
+    _SC_STRING_OBJECT = 0xFFFF000B
+    _SC_NUMBER_OBJECT = 0xFFFF000C
+    _SC_BACK_REFERENCE = 0xFFFF000D
+    _SC_TYPED_ARRAY_V2 = 0xFFFF0010
+    _SC_MAP_OBJECT = 0xFFFF0011
+    _SC_SET_OBJECT = 0xFFFF0012
+    _SC_END_OF_KEYS = 0xFFFF0013
+    _SC_DATA_VIEW_V2 = 0xFFFF0015
+    _SC_BIGINT = 0xFFFF001D
+    _SC_BIGINT_OBJECT = 0xFFFF001E
+    _SC_ARRAY_BUFFER = 0xFFFF001F
+    _SC_TYPED_ARRAY = 0xFFFF0020
+    _SC_DATA_VIEW = 0xFFFF0021
+    _SC_ERROR_OBJECT = 0xFFFF0022
+    _SC_TYPED_ARRAY_V1_MIN = 0xFFFF0100
+    _SC_TYPED_ARRAY_V1_MAX = 0xFFFF010A
+
+    class _StructuredCloneReader(object):
+        # Decode a SpiderMonkey JS_StructuredClone byte stream: sequence of
+        # 64-bit LE (tag, data) pairs where the high 32 bits are SCTAG and
+        # the low 32 bits are a type-specific payload. Bodies are read inline
+        # and padded to an 8-byte boundary between pairs.
+
+        def __init__(self, outer, buf):
+            self._sc = outer
+            self.buf = buf
+            self.pos = 0
+            self.objects = []  # back-reference table for SCTAG_BACK_REFERENCE
+
+        def _pair(self):
+            if self.pos + 8 > len(self.buf):
+                raise ValueError(f'EOF at {self.pos}')
+            pair = struct.unpack_from('<Q', self.buf, self.pos)[0]
+            self.pos += 8
+            return (pair >> 32) & 0xFFFFFFFF, pair & 0xFFFFFFFF, pair
+
+        def _align8(self):
+            rem = self.pos % 8
+            if rem:
+                self.pos += 8 - rem
+
+        def _bytes(self, n):
+            if self.pos + n > len(self.buf):
+                raise ValueError(f'EOF reading {n} at {self.pos}')
+            b = self.buf[self.pos:self.pos + n]
+            self.pos += n
+            return b
+
+        def _string(self, data):
+            # High bit of data = Latin-1 flag; low 31 bits = code-unit count.
+            latin1 = (data & 0x80000000) != 0
+            length = data & 0x7FFFFFFF
+            if latin1:
+                s = self._bytes(length).decode('latin-1', errors='replace')
+            else:
+                s = self._bytes(length * 2).decode('utf-16-le', errors='replace')
+            self._align8()
+            return s
+
+        def read(self):
+            tag, data, pair = self._pair()
+            if tag == self._sc._SC_HEADER:
+                tag, data, pair = self._pair()
+            return self._value(tag, data, pair)
+
+        def _value(self, tag, data, pair):
+            sc = self._sc
+            if tag < sc._SC_HEADER:
+                return struct.unpack('<d', struct.pack('<Q', pair))[0]
+            if tag == sc._SC_NULL:
+                return None
+            if tag == sc._SC_UNDEFINED:
+                return '<undefined>'
+            if tag == sc._SC_BOOLEAN:
+                return bool(data)
+            if tag == sc._SC_INT32:
+                return struct.unpack('<i', struct.pack('<I', data))[0]
+            if tag == sc._SC_STRING:
+                return self._string(data)
+            if tag == sc._SC_DATE_OBJECT:
+                ms = struct.unpack('<d', self._bytes(8))[0]
+                return f'<Date: {ms} ms>'
+            if tag == sc._SC_ARRAY_OBJECT:
+                arr = []
+                self.objects.append(arr)
+                while True:
+                    t2, d2, _ = self._pair()
+                    if t2 == sc._SC_END_OF_KEYS:
+                        break
+                    if t2 == sc._SC_INT32:
+                        idx = struct.unpack('<i', struct.pack('<I', d2))[0]
+                    elif t2 == sc._SC_STRING:
+                        idx = self._string(d2)
+                    else:
+                        idx = f'<idx tag 0x{t2:x}>'
+                    t3, d3, p3 = self._pair()
+                    val = self._value(t3, d3, p3)
+                    if isinstance(idx, int):
+                        while len(arr) <= idx:
+                            arr.append(None)
+                        arr[idx] = val
+                    else:
+                        arr.append((idx, val))
+                return arr
+            if tag == sc._SC_OBJECT_OBJECT:
+                obj = {}
+                self.objects.append(obj)
+                while True:
+                    t2, d2, _ = self._pair()
+                    if t2 == sc._SC_END_OF_KEYS:
+                        break
+                    if t2 == sc._SC_STRING:
+                        key = self._string(d2)
+                    elif t2 == sc._SC_INT32:
+                        key = struct.unpack('<i', struct.pack('<I', d2))[0]
+                    else:
+                        key = f'<key tag 0x{t2:x}>'
+                    t3, d3, p3 = self._pair()
+                    obj[key] = self._value(t3, d3, p3)
+                return obj
+            if tag == sc._SC_BACK_REFERENCE:
+                return self.objects[data] if data < len(self.objects) \
+                    else f'<backref {data}>'
+            if tag == sc._SC_MAP_OBJECT:
+                m = {}
+                self.objects.append(m)
+                while True:
+                    t2, d2, p2 = self._pair()
+                    if t2 == sc._SC_END_OF_KEYS:
+                        break
+                    k = self._value(t2, d2, p2)
+                    t3, d3, p3 = self._pair()
+                    m[str(k)] = self._value(t3, d3, p3)
+                return m
+            if tag == sc._SC_SET_OBJECT:
+                s = []
+                self.objects.append(s)
+                while True:
+                    t2, d2, p2 = self._pair()
+                    if t2 == sc._SC_END_OF_KEYS:
+                        break
+                    s.append(self._value(t2, d2, p2))
+                return s
+            if tag == sc._SC_STRING_OBJECT:
+                return self._string(data)
+            if tag == sc._SC_BOOLEAN_OBJECT:
+                return bool(data)
+            if tag == sc._SC_NUMBER_OBJECT:
+                return struct.unpack('<d', self._bytes(8))[0]
+            if tag in (sc._SC_BIGINT, sc._SC_BIGINT_OBJECT):
+                sign = (data & 0x80000000) != 0
+                n_digits = data & 0x7FFFFFFF
+                raw = self._bytes(n_digits * 8)
+                v = 0
+                for i in range(n_digits):
+                    v |= struct.unpack_from('<Q', raw, i * 8)[0] << (64 * i)
+                return -v if sign else v
+            if tag == sc._SC_ARRAY_BUFFER:
+                n = data
+                self._bytes(n)
+                self._align8()
+                return f'<ArrayBuffer: {n} bytes>'
+            if tag == sc._SC_ARRAY_BUFFER_V2:
+                n = struct.unpack('<Q', self._bytes(8))[0]
+                self._bytes(n)
+                self._align8()
+                return f'<ArrayBuffer (v2): {n} bytes>'
+            if tag == sc._SC_TYPED_ARRAY:
+                scalar = data
+                t2, d2, _ = self._pair()
+                length = struct.unpack('<i', struct.pack('<I', d2))[0] \
+                    if t2 == sc._SC_INT32 else d2
+                self._pair()
+                t4, d4, p4 = self._pair()
+                self._value(t4, d4, p4)
+                return f'<TypedArray[scalar={scalar}]: {length} elements>'
+            if tag == sc._SC_TYPED_ARRAY_V2:
+                scalar = data
+                n = struct.unpack('<Q', self._bytes(8))[0]
+                self._bytes(n)
+                self._align8()
+                return f'<TypedArray (v2)[scalar={scalar}]: {n} bytes>'
+            if tag == sc._SC_DATA_VIEW:
+                self._pair()
+                self._pair()
+                t4, d4, p4 = self._pair()
+                self._value(t4, d4, p4)
+                return '<DataView>'
+            if tag == sc._SC_DATA_VIEW_V2:
+                n = struct.unpack('<Q', self._bytes(8))[0]
+                self._bytes(n)
+                self._align8()
+                return '<DataView (v2)>'
+            if sc._SC_TYPED_ARRAY_V1_MIN <= tag <= sc._SC_TYPED_ARRAY_V1_MAX:
+                length = data
+                t2, d2, p2 = self._pair()
+                self._value(t2, d2, p2)
+                return f'<TypedArray (v1): {length} elements>'
+            if tag == sc._SC_REGEXP_OBJECT:
+                flags = data
+                t2, d2, _ = self._pair()
+                src = self._string(d2) if t2 == sc._SC_STRING else '<not string>'
+                return f'/{src}/<flags={flags}>'
+            if tag == sc._SC_ERROR_OBJECT:
+                return '<Error>'
+            return f'<unknown SCTAG 0x{tag:08x}>'
+
+    # IDB key type prefixes from mozilla-central/dom/indexedDB/Key.cpp.
+    _IDB_KEY_FLOAT = 0x10
+    _IDB_KEY_DATE = 0x20
+    _IDB_KEY_STRING = 0x30
+    _IDB_KEY_BINARY = 0x40
+    _IDB_KEY_ARRAY = 0x50
+    _IDB_KEY_TERMINATOR = 0x00
+
+    @classmethod
+    def _decode_idb_key(cls, raw):
+        # IDB key encoding: one-byte type prefix + sortable encoding.
+        # We aim for a recognizable string, not perfect round-tripping.
+        if not raw:
+            return ''
+        raw = bytes(raw)
+
+        def _decode_one(buf, pos):
+            if pos >= len(buf):
+                return '', pos
+            t = buf[pos]
+            pos += 1
+            if t == cls._IDB_KEY_STRING:
+                chars = []
+                while pos < len(buf):
+                    b = buf[pos]
+                    if b == 0:
+                        pos += 1
+                        break
+                    if b <= 0x7F:
+                        chars.append(chr(b - 1))
+                        pos += 1
+                    elif b <= 0xBF and pos + 1 < len(buf):
+                        c = ((b & 0x3F) << 8) | buf[pos + 1]
+                        chars.append(chr(c + 0x7F))
+                        pos += 2
+                    elif pos + 2 < len(buf):
+                        c = ((b & 0x3F) << 10) | (buf[pos + 1] << 2) | (buf[pos + 2] >> 6)
+                        chars.append(chr(c + 0x3FFF + 0x80))
+                        pos += 3
+                    else:
+                        pos += 1
+                return ''.join(chars), pos
+            if t == cls._IDB_KEY_FLOAT or t == cls._IDB_KEY_DATE:
+                if pos + 8 > len(buf):
+                    return f'<truncated {t:02x}>', len(buf)
+                # Big-endian with sign-bit flipped so negatives sort before positives; undo.
+                raw8 = bytearray(buf[pos:pos + 8])
+                pos += 8
+                if raw8[0] & 0x80:
+                    raw8[0] &= 0x7F
+                else:
+                    for i in range(8):
+                        raw8[i] ^= 0xFF
+                d = struct.unpack('>d', bytes(raw8))[0]
+                if t == cls._IDB_KEY_DATE:
+                    return f'<Date: {d} ms>', pos
+                return repr(d), pos
+            if t == cls._IDB_KEY_BINARY:
+                end = buf.find(b'\x00', pos)
+                if end == -1:
+                    end = len(buf)
+                chunk = buf[pos:end]
+                return f'<binary: {chunk.hex()}>', end + 1
+            if t == cls._IDB_KEY_ARRAY:
+                items = []
+                while pos < len(buf) and buf[pos] != cls._IDB_KEY_TERMINATOR:
+                    item, pos = _decode_one(buf, pos)
+                    items.append(item)
+                if pos < len(buf):
+                    pos += 1
+                return '[' + ', '.join(items) + ']', pos
+            return f'<unknown idb key type 0x{t:02x}: {buf[pos:].hex()}>', len(buf)
+
+        try:
+            value, _ = _decode_one(raw, 0)
+            return value
+        except Exception:
+            return raw.hex()
+
+    @staticmethod
+    def _stringify_idb_value(obj, max_len=2000):
+        try:
+            s = json.dumps(obj, default=str, ensure_ascii=False)
+        except (TypeError, ValueError):
+            s = str(obj)
+        if len(s) > max_len:
+            s = s[:max_len] + f' ...[truncated {len(s) - max_len} chars]'
+        return s
+
+    def get_indexeddb(self, path):
+        storage_root = os.path.join(path, 'storage', 'default')
+        log.info(f'IndexedDB from {storage_root}:')
+        if not os.path.isdir(storage_root):
+            log.info(' - storage/default not present')
+            return
+
+        results = []
+        idb_files_seen = 0
+        idb_files_with_data = 0
+        decode_failures = 0
+        empty_blobs = 0
+
+        for origin_folder in sorted(os.listdir(storage_root)):
+            idb_dir = os.path.join(storage_root, origin_folder, 'idb')
+            if not os.path.isdir(idb_dir):
+                continue
+            for db_filename in sorted(os.listdir(idb_dir)):
+                if not db_filename.endswith('.sqlite'):
+                    continue
+                idb_files_seen += 1
+
+                conn = utils.open_sqlite_db(self, idb_dir, db_filename)
+                if not conn:
+                    continue
+
+                try:
+                    cursor = conn.cursor()
+
+                    origin = self._decode_origin_folder(origin_folder)
+                    db_name = db_filename[:-len('.sqlite')]
+                    try:
+                        cursor.execute(
+                            'SELECT origin, name FROM database LIMIT 1')
+                        row = cursor.fetchone()
+                        if row:
+                            origin = row.get('origin') or origin
+                            db_name = row.get('name') or db_name
+                    except Exception:
+                        pass
+
+                    store_names = {}
+                    try:
+                        cursor.execute(
+                            'SELECT id, name FROM object_store')
+                        for r in cursor:
+                            store_names[r.get('id')] = r.get('name') or ''
+                    except Exception:
+                        pass
+
+                    try:
+                        cursor.execute(
+                            'SELECT object_store_id, key, data FROM object_data')
+                    except Exception as e:
+                        log.debug(f' - {db_filename}: object_data unreadable ({e})')
+                        continue
+
+                    source_path = os.path.relpath(
+                        os.path.join(idb_dir, db_filename), self.profile_path)
+                    seq = 0
+                    got_any = False
+                    for row in cursor:
+                        seq += 1
+                        store_id = row.get('object_store_id')
+                        store_name = store_names.get(store_id, f'store_{store_id}')
+                        key_blob = row.get('key')
+                        data_blob = row.get('data')
+
+                        key_str = self._decode_idb_key(key_blob) if key_blob else ''
+
+                        value_str = ''
+                        if data_blob:
+                            try:
+                                decompressed = self._snappy_decompress(bytes(data_blob))
+                                reader = Firefox._StructuredCloneReader(self, decompressed)
+                                value_obj = reader.read()
+                                value_str = self._stringify_idb_value(value_obj)
+                            except Exception as e:
+                                decode_failures += 1
+                                value_str = f'<decode failed: {e}>'
+                        else:
+                            empty_blobs += 1
+
+                        item = Firefox.IndexedDBItem(
+                            profile=self.profile_path,
+                            origin=origin,
+                            key=key_str,
+                            value=value_str,
+                            seq=seq,
+                            state='Live',
+                            database=f'{db_name}.{store_name}',
+                            source_path=source_path,
+                        )
+                        results.append(item)
+                        got_any = True
+                    if got_any:
+                        idb_files_with_data += 1
+                finally:
+                    conn.close()
+
+        self.artifacts_counts['IndexedDB'] = len(results)
+        log.info(
+            f' - Parsed {len(results)} records from {idb_files_with_data} '
+            f'IndexedDB files ({idb_files_seen} scanned, '
+            f'{decode_failures} decode failures, {empty_blobs} empty blobs)'
+        )
+        self.parsed_storage.extend(results)
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -1980,6 +2398,11 @@ class Firefox(WebBrowser):
             self.artifacts_display['Local Storage'] = 'Local Storage records'
             print((self.format_processing_output(
                 'Local Storage records', self.artifacts_counts.get('Local Storage', 0))))
+
+            self.get_indexeddb(self.profile_path)
+            self.artifacts_display['IndexedDB'] = 'IndexedDB records'
+            print((self.format_processing_output(
+                'IndexedDB records', self.artifacts_counts.get('IndexedDB', 0))))
 
         cache_dir = self._resolve_cache_dir()
         if cache_dir:
