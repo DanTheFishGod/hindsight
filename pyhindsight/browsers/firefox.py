@@ -2293,6 +2293,188 @@ class Firefox(WebBrowser):
         )
         self.parsed_storage.extend(results)
 
+    def get_cache_storage(self, path):
+        # Cache API (JS-visible, used by Service Workers) is distinct from cache2.
+        # Each origin has cache/caches.sqlite + a morgue/<bucket>/<uuid>.final tree;
+        # bucket is the last two hex chars of the body UUID parsed as decimal.
+        storage_root = os.path.join(path, 'storage', 'default')
+        log.info(f'Cache API storage from {storage_root}:')
+        if not os.path.isdir(storage_root):
+            log.info(' - storage/default not present')
+            return
+
+        results = []
+        origins_seen = 0
+        origins_with_data = 0
+        missing_bodies = 0
+
+        for origin_folder in sorted(os.listdir(storage_root)):
+            cache_dir = os.path.join(storage_root, origin_folder, 'cache')
+            db_file = os.path.join(cache_dir, 'caches.sqlite')
+            if not os.path.isfile(db_file):
+                continue
+            origins_seen += 1
+            morgue_dir = os.path.join(cache_dir, 'morgue')
+
+            conn = utils.open_sqlite_db(self, cache_dir, 'caches.sqlite')
+            if not conn:
+                continue
+
+            try:
+                cursor = conn.cursor()
+
+                origin = self._decode_origin_folder(origin_folder)
+
+                # Cache names are UTF-16-LE BLOBs in storage.key.
+                cache_names = {}
+                try:
+                    cursor.execute(
+                        'SELECT cache_id, key FROM storage')
+                    for row in cursor:
+                        cid = row.get('cache_id')
+                        key_bytes = row.get('key')
+                        if key_bytes is None:
+                            continue
+                        try:
+                            cache_names[cid] = bytes(key_bytes).decode(
+                                'utf-16-le', errors='replace')
+                        except Exception:
+                            cache_names[cid] = f'<cache {cid}>'
+                except Exception:
+                    pass
+
+                headers_by_entry = {}
+                try:
+                    cursor.execute(
+                        'SELECT entry_id, name, value FROM response_headers')
+                    for row in cursor:
+                        eid = row.get('entry_id')
+                        headers_by_entry.setdefault(eid, []).append(
+                            (row.get('name'), row.get('value')))
+                except Exception:
+                    pass
+
+                try:
+                    cursor.execute(
+                        'SELECT id, cache_id, request_method, '
+                        '       request_url_no_query, request_url_query, '
+                        '       request_referrer, response_status, '
+                        '       response_status_text, response_body_id, '
+                        '       response_body_disk_size '
+                        'FROM entries'
+                    )
+                except Exception as e:
+                    log.debug(f' - {origin_folder}: entries unreadable ({e})')
+                    continue
+
+                source_item = os.path.relpath(db_file, self.profile_path)
+                got_any = False
+                file_mtime = None
+                try:
+                    file_mtime = os.path.getmtime(db_file)
+                except OSError:
+                    pass
+
+                for row in cursor:
+                    eid = row.get('id')
+                    cid = row.get('cache_id')
+                    cache_name = cache_names.get(cid, f'cache_{cid}')
+
+                    base_url = row.get('request_url_no_query') or ''
+                    query = row.get('request_url_query') or ''
+                    url = base_url + query
+
+                    body_id = row.get('response_body_id') or ''
+                    body_size = row.get('response_body_disk_size') or 0
+                    body_path = ''
+                    if body_id:
+                        stripped = body_id.strip('{}')
+                        if len(stripped) >= 2:
+                            try:
+                                bucket = int(stripped[-2:], 16)
+                                cand = os.path.join(
+                                    morgue_dir, str(bucket), f'{body_id}.final')
+                                if os.path.isfile(cand):
+                                    body_path = os.path.relpath(
+                                        cand, self.profile_path)
+                                else:
+                                    missing_bodies += 1
+                            except ValueError:
+                                pass
+
+                    headers = dict(headers_by_entry.get(eid, []))
+                    content_type = headers.get('content-type', '')
+                    etag = headers.get('etag', '') or ''
+                    last_modified = headers.get('last-modified', '') or ''
+
+                    if content_type and body_size:
+                        data_summary = f'{content_type} ({body_size} bytes)'
+                    elif content_type:
+                        data_summary = content_type
+                    elif body_size:
+                        data_summary = f'{body_size} bytes'
+                    else:
+                        data_summary = '<no body>'
+
+                    location_parts = [f'cache: {cache_name}']
+                    if body_path:
+                        location_parts.append(f'body: {body_path}')
+                    elif body_id:
+                        location_parts.append(f'body_id: {body_id} (file missing)')
+                    locations = '; '.join(location_parts)
+
+                    interp_parts = []
+                    status = row.get('response_status')
+                    status_text = row.get('response_status_text') or ''
+                    method = row.get('request_method') or 'GET'
+                    interp_parts.append(f'{method} -> {status} {status_text}'.strip())
+                    referrer = row.get('request_referrer') or ''
+                    if referrer:
+                        interp_parts.append(f'Referrer: {referrer}')
+                    interpretation = '; '.join(interp_parts)
+
+                    if file_mtime:
+                        request_time = datetime.datetime.fromtimestamp(
+                            file_mtime, datetime.timezone.utc)
+                        if self.timezone:
+                            request_time = request_time.astimezone(self.timezone)
+                    else:
+                        request_time = datetime.datetime.fromtimestamp(
+                            0, datetime.timezone.utc)
+
+                    item = Firefox.CacheItem(
+                        profile=self.profile_path,
+                        url=url,
+                        title=None,
+                        request_time=request_time,
+                        locations=locations,
+                        key=body_id,
+                        metadata=None,
+                        data=None,
+                    )
+                    item.row_type = 'cache (Cache API)'
+                    item.data_summary = data_summary
+                    item.http_headers_str = str(headers) if headers else ''
+                    item.etag = etag
+                    item.last_modified = last_modified
+                    item.interpretation = interpretation
+                    item.source_item = source_item
+                    results.append(item)
+                    got_any = True
+
+                if got_any:
+                    origins_with_data += 1
+            finally:
+                conn.close()
+
+        self.artifacts_counts['Cache API'] = len(results)
+        log.info(
+            f' - Parsed {len(results)} entries from {origins_with_data} '
+            f'origins ({origins_seen} scanned, {missing_bodies} bodies '
+            f'missing from morgue)'
+        )
+        self.parsed_artifacts.extend(results)
+
     def process(self):
         try:
             input_listing = os.listdir(self.profile_path)
@@ -2403,6 +2585,11 @@ class Firefox(WebBrowser):
             self.artifacts_display['IndexedDB'] = 'IndexedDB records'
             print((self.format_processing_output(
                 'IndexedDB records', self.artifacts_counts.get('IndexedDB', 0))))
+
+            self.get_cache_storage(self.profile_path)
+            self.artifacts_display['Cache API'] = 'Cache API records'
+            print((self.format_processing_output(
+                'Cache API records', self.artifacts_counts.get('Cache API', 0))))
 
         cache_dir = self._resolve_cache_dir()
         if cache_dir:
