@@ -1,0 +1,27 @@
+{
+  "nextId": 2,
+  "logins": [
+    {
+      "id": 1,
+      "hostname": "https://en.wikipedia.org",
+      "httpRealm": null,
+      "formSubmitURL": "https://en.wikipedia.org",
+      "usernameField": "wpName",
+      "passwordField": "wpPassword",
+      "encryptedUsername": "MDoEEPgAAAAAAAAAAAAAAAAAAAEwFAYIKoZIhvcNAwcECEXAMPLE==",
+      "encryptedPassword": "MDoEEPgAAAAAAAAAAAAAAAAAAAEwFAYIKoZIhvcNAwcECEXAMPLE==",
+      "guid": "{deadbeef-dead-beef-dead-beefdeadbeef}",
+      "encType": 1,
+      "timeCreated": 1705320000000,
+      "timeLastUsed": 1705406400000,
+      "timePasswordChanged": 1705492800000,
+      "timesUsed": 5,
+      "syncCounter": 1,
+      "everSynced": false,
+      "encryptedUnknownFields": null
+    }
+  ],
+  "potentiallyVulnerablePasswords": [],
+  "dismissedBreachAlertsByLoginGUID": {},
+  "version": 3
+}

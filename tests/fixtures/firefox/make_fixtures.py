@@ -1,5 +1,6 @@
 # Run from the repo root: python tests/fixtures/firefox/make_fixtures.py
 import datetime
+import json
 import os
 import sqlite3
 
@@ -163,9 +164,193 @@ def make_places():
     )
 
 
+def make_cookies():
+    """cookies.sqlite with 2 cookies (one HttpOnly+Secure, one session)."""
+    schema = """
+    CREATE TABLE moz_cookies (
+        id INTEGER PRIMARY KEY,
+        originAttributes TEXT NOT NULL DEFAULT '',
+        name TEXT,
+        value TEXT,
+        host TEXT,
+        path TEXT,
+        expiry INTEGER,
+        lastAccessed INTEGER,
+        creationTime INTEGER,
+        isSecure INTEGER,
+        isHttpOnly INTEGER,
+        inBrowserElement INTEGER DEFAULT 0,
+        sameSite INTEGER DEFAULT 0,
+        rawSameSite INTEGER DEFAULT 0,
+        schemeMap INTEGER DEFAULT 0,
+        isPartitionedAttributeSet INTEGER DEFAULT 0
+    );
+    """
+    rows = [
+        # Wikipedia cookie: last-access a day after creation -> both rows emitted.
+        (1, '', 'WMF-Last-Access', '15-Jan-2024',
+         '.wikipedia.org', '/',
+         int((REF_DT + datetime.timedelta(days=365)).timestamp()),
+         REF_PRTIME + 86_400_000_000, REF_PRTIME,
+         1, 1, 0, 0, 0, 0, 0),
+        # Session cookie (expiry=0); creation == last-access -> only created row.
+        (2, '', 'session', 'abc123',
+         '.example.com', '/',
+         0,
+         REF_PRTIME + 1_000_000, REF_PRTIME + 1_000_000,
+         0, 0, 0, 0, 0, 0, 0),
+    ]
+    _write_sqlite(
+        os.path.join(HERE, 'cookies.sqlite'),
+        schema,
+        {'moz_cookies': rows},
+    )
+
+
+def make_form_history():
+    """formhistory.sqlite with 2 saved form-field values."""
+    schema = """
+    CREATE TABLE moz_formhistory (
+        id INTEGER PRIMARY KEY,
+        fieldname TEXT NOT NULL,
+        value TEXT NOT NULL,
+        timesUsed INTEGER,
+        firstUsed INTEGER,
+        lastUsed INTEGER,
+        guid TEXT
+    );
+    """
+    rows = [
+        (1, 'email', 'forensic@example.com', 3, REF_PRTIME, REF_PRTIME + 86_400_000_000, 'guid1aaa'),
+        (2, 'searchbar-history', 'computer forensics', 1, REF_PRTIME, REF_PRTIME, 'guid2bbb'),
+    ]
+    _write_sqlite(
+        os.path.join(HERE, 'formhistory.sqlite'),
+        schema,
+        {'moz_formhistory': rows},
+    )
+
+
+def make_permissions():
+    """permissions.sqlite with 2 site permissions."""
+    schema = """
+    CREATE TABLE moz_perms (
+        id INTEGER PRIMARY KEY,
+        origin TEXT,
+        type TEXT,
+        permission INTEGER,
+        expireType INTEGER,
+        expireTime INTEGER,
+        modificationTime INTEGER
+    );
+    """
+    # modificationTime is unix ms (not PRTime).
+    ref_ms = int(REF_DT.timestamp() * 1000)
+    rows = [
+        (1, 'https://en.wikipedia.org', 'desktop-notification', 2, 0, 0, ref_ms),
+        (2, 'https://example.com', 'geo', 1, 2,
+         ref_ms + 365 * 24 * 3600 * 1000, ref_ms),
+    ]
+    _write_sqlite(
+        os.path.join(HERE, 'permissions.sqlite'),
+        schema,
+        {'moz_perms': rows},
+    )
+
+
+def make_logins_json():
+    """logins.json with one saved credential (encrypted blobs are opaque)."""
+    ref_ms = int(REF_DT.timestamp() * 1000)
+    data = {
+        'nextId': 2,
+        'logins': [{
+            'id': 1,
+            'hostname': 'https://en.wikipedia.org',
+            'httpRealm': None,
+            'formSubmitURL': 'https://en.wikipedia.org',
+            'usernameField': 'wpName',
+            'passwordField': 'wpPassword',
+            'encryptedUsername': 'MDoEEPgAAAAAAAAAAAAAAAAAAAEwFAYIKoZIhvcNAwcECEXAMPLE==',
+            'encryptedPassword': 'MDoEEPgAAAAAAAAAAAAAAAAAAAEwFAYIKoZIhvcNAwcECEXAMPLE==',
+            'guid': '{deadbeef-dead-beef-dead-beefdeadbeef}',
+            'encType': 1,
+            'timeCreated': ref_ms,
+            'timeLastUsed': ref_ms + 86_400_000,
+            'timePasswordChanged': ref_ms + 86_400_000 * 2,
+            'timesUsed': 5,
+            'syncCounter': 1,
+            'everSynced': False,
+            'encryptedUnknownFields': None,
+        }],
+        'potentiallyVulnerablePasswords': [],
+        'dismissedBreachAlertsByLoginGUID': {},
+        'version': 3,
+    }
+    with open(os.path.join(HERE, 'logins.json'), 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+
+
+def make_extensions_json():
+    """extensions.json with one installed addon."""
+    ref_ms = int(REF_DT.timestamp() * 1000)
+    data = {
+        'schemaVersion': 37,
+        'addons': [{
+            'id': 'uBlock0@raymondhill.net',
+            'version': '1.55.0',
+            'type': 'extension',
+            'active': True,
+            'userDisabled': False,
+            'appDisabled': False,
+            'signedState': 2,
+            'sourceURI': 'https://addons.mozilla.org/firefox/downloads/file/4188948/ublock_origin-1.55.0.xpi',
+            'location': 'app-profile',
+            'path': 'C:\\Users\\test\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\test.default\\extensions\\uBlock0@raymondhill.net.xpi',
+            'rootURI': 'jar:file:///C:/Users/test/AppData/Roaming/Mozilla/Firefox/Profiles/test.default/extensions/uBlock0@raymondhill.net.xpi!/',
+            'installDate': ref_ms,
+            'updateDate': ref_ms + 86_400_000 * 7,
+            'defaultLocale': {
+                'name': 'uBlock Origin',
+                'description': 'Finally, an efficient blocker.',
+            },
+            'userPermissions': {
+                'permissions': ['storage', 'webRequest'],
+                'origins': ['<all_urls>'],
+            },
+        }],
+    }
+    with open(os.path.join(HERE, 'extensions.json'), 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+
+
+def make_prefs_js():
+    """prefs.js with a handful of forensically interesting preferences."""
+    content = '''// Mozilla User Preferences
+
+user_pref("browser.startup.homepage", "https://en.wikipedia.org/");
+user_pref("browser.download.lastDir", "C:\\\\Users\\\\test\\\\Downloads");
+user_pref("browser.download.useDownloadDir", false);
+user_pref("network.proxy.type", 0);
+user_pref("signon.rememberSignons", true);
+user_pref("toolkit.telemetry.enabled", false);
+user_pref("services.sync.username", "test@example.com");
+user_pref("browser.search.region", "US");
+user_pref("intl.accept_languages", "en-US, en");
+user_pref("app.installation.timestamp", "1705320000000000");
+'''
+    with open(os.path.join(HERE, 'prefs.js'), 'w', encoding='utf-8') as f:
+        f.write(content)
+
+
 def main():
     print(f'Writing fixtures to {HERE}')
     make_places()
+    make_cookies()
+    make_form_history()
+    make_permissions()
+    make_logins_json()
+    make_extensions_json()
+    make_prefs_js()
     print('done.')
 
 
