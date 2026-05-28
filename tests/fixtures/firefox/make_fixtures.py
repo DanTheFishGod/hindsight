@@ -3,6 +3,7 @@ import datetime
 import json
 import os
 import sqlite3
+import struct
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -342,6 +343,110 @@ user_pref("app.installation.timestamp", "1705320000000000");
         f.write(content)
 
 
+def _snappy_encode_raw(data):
+    # Literal-tag-only encoder; round-trips through the decoder Firefox uses.
+    out = bytearray()
+    n = len(data)
+    while True:
+        if n < 0x80:
+            out.append(n)
+            break
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    i = 0
+    while i < len(data):
+        chunk_len = min(60, len(data) - i)
+        out.append((chunk_len - 1) << 2)
+        out.extend(data[i:i + chunk_len])
+        i += chunk_len
+    return bytes(out)
+
+
+def make_local_storage():
+    # storage/default/https+++en.wikipedia.org/ls/data.sqlite with one
+    # uncompressed and one snappy-compressed value.
+    origin_dir = os.path.join(
+        HERE, 'storage', 'default', 'https+++en.wikipedia.org', 'ls')
+    os.makedirs(origin_dir, exist_ok=True)
+
+    schema = """
+    CREATE TABLE database (
+        origin TEXT NOT NULL,
+        usage INTEGER NOT NULL DEFAULT 0,
+        last_vacuum_time INTEGER NOT NULL DEFAULT 0,
+        last_analyze_time INTEGER NOT NULL DEFAULT 0,
+        last_vacuum_size INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE data (
+        key TEXT PRIMARY KEY,
+        utf16_length INTEGER NOT NULL,
+        conversion_type INTEGER NOT NULL,
+        compression_type INTEGER NOT NULL,
+        last_access_time INTEGER NOT NULL,
+        value BLOB NOT NULL
+    );
+    """
+
+    long_value = b'{"recent_articles": ["Computer forensics", "Cryptography", "Steganography"], "sessionCount": 42}'
+    rows_data = [
+        ('theme', 4, 1, 0, REF_PRTIME, b'dark'),
+        ('app_state', len(long_value), 1, 1, REF_PRTIME,
+         _snappy_encode_raw(long_value)),
+    ]
+    rows_database = [
+        ('https://en.wikipedia.org', 4096, 0, 0, 0),
+    ]
+    _write_sqlite(
+        os.path.join(origin_dir, 'data.sqlite'),
+        schema,
+        {'database': rows_database, 'data': rows_data},
+    )
+
+
+def make_cache2_entry():
+    # Layout (BE unless noted): [body | chunk_hashes | metadata_block | u32 meta_offset]
+    cache_dir = os.path.join(HERE, 'cache2', 'entries')
+    os.makedirs(cache_dir, exist_ok=True)
+
+    body = b'<html><head><title>Computer forensics</title></head></html>'
+    meta_offset = len(body)
+
+    key = b':https://en.wikipedia.org/wiki/Computer_forensics'
+    key_size = len(key)
+    fetched_secs = int(REF_DT.timestamp())
+    header = struct.pack(
+        '>IIIIIIII',
+        3,
+        7,
+        fetched_secs,
+        fetched_secs - 60,
+        100,
+        fetched_secs + 86400,
+        key_size,
+        0,
+    )
+    elements = (
+        b'response-head\x00'
+        b'HTTP/2 200 OK\r\ncontent-type: text/html; charset=UTF-8\r\netag: "fixture-etag"\r\nlast-modified: Mon, 15 Jan 2024 11:00:00 GMT\r\n\x00'
+        b'request-method\x00GET\x00'
+    )
+    crc = b'\x00' * 4  # parser ignores CRC
+    meta_block = crc + header + key + b'\x00' + elements
+
+    chunk_size = 256 * 1024
+    n_chunks = (meta_offset + chunk_size - 1) // chunk_size
+    hash_arr = b'\x00' * (n_chunks * 2)
+
+    trailing = struct.pack('>I', meta_offset)
+
+    entry_path = os.path.join(cache_dir, 'FIXTUREENTRY00000000000000000000FIXTURE0')
+    with open(entry_path, 'wb') as f:
+        f.write(body)
+        f.write(hash_arr)
+        f.write(meta_block)
+        f.write(trailing)
+
+
 def main():
     print(f'Writing fixtures to {HERE}')
     make_places()
@@ -351,6 +456,8 @@ def main():
     make_logins_json()
     make_extensions_json()
     make_prefs_js()
+    make_local_storage()
+    make_cache2_entry()
     print('done.')
 
 
