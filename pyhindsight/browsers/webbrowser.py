@@ -566,6 +566,126 @@ class WebBrowser(object):
             self.file_size = file_size
             self.magic_results = magic_results
 
+    class ServiceWorkerUserDataItem(StorageItem):
+        def __init__(self, profile, scope_url, registration_id, user_data_key,
+                     subsystem, decoded_value, raw_value_size, seq, state, source_path,
+                     event_time=None):
+            super(WebBrowser.ServiceWorkerUserDataItem, self).__init__(
+                'service worker (user data)', profile=profile, origin=scope_url or '',
+                key=user_data_key, value=decoded_value, seq=seq, state=state,
+                source_path=source_path, interpretation=subsystem,
+                last_modified=event_time)
+            self.scope_url = scope_url
+            self.registration_id = registration_id
+            self.user_data_key = user_data_key
+            self.subsystem = subsystem
+            self.raw_value_size = raw_value_size
+            self.event_time = event_time
+
+    class ServiceWorkerCacheStorageItem(StorageItem):
+        def __init__(self, profile, storage_key, origin_hash, cache_name, cache_uuid,
+                     request_url, request_method, response_status, response_status_text,
+                     response_type, response_mime_type, final_url, body_size, body_sha256,
+                     entry_time, response_time, source_file, source_path):
+            value_parts = []
+            if request_method:
+                value_parts.append(f'method={request_method}')
+            if response_status is not None:
+                value_parts.append(f'status={response_status} {response_status_text}'.strip())
+            if response_type:
+                value_parts.append(f'response_type={response_type}')
+            if response_mime_type:
+                value_parts.append(f'mime_type={response_mime_type}')
+            if body_size is not None:
+                value_parts.append(f'body_size={body_size}')
+            if body_sha256:
+                value_parts.append(f'sha256={body_sha256}')
+            if cache_name:
+                value_parts.append(f'cache_name={cache_name!r}')
+            if final_url:
+                value_parts.append(f'final_url={final_url}')
+            super(WebBrowser.ServiceWorkerCacheStorageItem, self).__init__(
+                'service worker (cache storage)', profile=profile,
+                origin=storage_key or origin_hash or '', key=request_url,
+                value='; '.join(value_parts), state='Live', source_path=source_path,
+                last_modified=entry_time)
+            self.storage_key = storage_key
+            self.origin_hash = origin_hash
+            self.cache_name = cache_name
+            self.cache_uuid = cache_uuid
+            self.request_url = request_url
+            self.request_method = request_method
+            self.response_status = response_status
+            self.response_status_text = response_status_text
+            self.response_type = response_type
+            self.response_mime_type = response_mime_type
+            self.final_url = final_url
+            self.body_size = body_size
+            self.body_sha256 = body_sha256
+            self.entry_time = entry_time
+            self.response_time = response_time
+            self.source_file = source_file
+
+    class ServiceWorkerScriptItem(StorageItem):
+        def __init__(self, profile, scope_url, version_id, resource_id, url,
+                     http_status, content_type, body_size, body_sha256,
+                     body_sha256_match, response_time, request_time,
+                     source_file, source_path):
+            value_parts = [f'resource_id={resource_id}']
+            if version_id is not None:
+                value_parts.append(f'version_id={version_id}')
+            if http_status:
+                value_parts.append(f'http_status={http_status}')
+            if content_type:
+                value_parts.append(f'content_type={content_type}')
+            if body_size is not None:
+                value_parts.append(f'body_size={body_size}')
+            if body_sha256:
+                value_parts.append(f'sha256={body_sha256}')
+            if body_sha256_match is True:
+                value_parts.append('sha256_match=ldb')
+            elif body_sha256_match is False:
+                value_parts.append('sha256_match=MISMATCH')
+            super(WebBrowser.ServiceWorkerScriptItem, self).__init__(
+                'service worker (script body)', profile=profile, origin=scope_url or '',
+                key=url or f'resource_id={resource_id}', value='; '.join(value_parts),
+                state='Live', source_path=source_path, last_modified=response_time)
+            self.scope_url = scope_url
+            self.version_id = version_id
+            self.resource_id = resource_id
+            self.url = url
+            self.http_status = http_status
+            self.content_type = content_type
+            self.body_size = body_size
+            self.body_sha256 = body_sha256
+            self.body_sha256_match = body_sha256_match
+            self.response_time = response_time
+            self.request_time = request_time
+            self.source_file = source_file
+
+    class ServiceWorkerResourceItem(StorageItem):
+        def __init__(self, profile, scope_url, version_id, resource_id, url, size_bytes,
+                     sha256_checksum, resource_state, seq, state, source_path):
+            value_parts = [f'resource_state={resource_state}', f'resource_id={resource_id}']
+            if version_id is not None:
+                value_parts.append(f'version_id={version_id}')
+            if size_bytes is not None:
+                value_parts.append(f'size_bytes={size_bytes}')
+            if sha256_checksum:
+                value_parts.append(f'sha256={sha256_checksum}')
+            display_key = url if url else f'resource_id={resource_id}'
+            super(WebBrowser.ServiceWorkerResourceItem, self).__init__(
+                'service worker (resource)', profile=profile, origin=scope_url or '',
+                key=display_key, value='; '.join(value_parts), seq=seq, state=state,
+                source_path=source_path)
+            self.scope_url = scope_url
+            self.version_id = version_id
+            self.resource_id = resource_id
+            self.url = url
+            self.size_bytes = size_bytes
+            self.sha256_checksum = sha256_checksum
+            self.resource_state = resource_state
+
     class ServiceWorkerItem(StorageItem):
         def __init__(self, profile, origin, scope_url, script_url, registration_id, version_id,
                      is_active, has_fetch_handler, last_update_check_time, resources_total_size_bytes,
@@ -589,7 +709,7 @@ class WebBrowser(object):
             if script_response_time is not None:
                 value_parts.append(f'script_response_time={script_response_time}')
             super(WebBrowser.ServiceWorkerItem, self).__init__(
-                'service worker', profile=profile, origin=origin, key=script_url,
+                'service worker (registration)', profile=profile, origin=origin, key=script_url,
                 value='; '.join(value_parts), seq=seq, state=state, source_path=source_path,
                 last_modified=last_update_check_time)
             self.scope_url = scope_url
