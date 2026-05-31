@@ -2636,8 +2636,7 @@ class Chrome(WebBrowser):
 
         from pyhindsight.lib.proto.components.services.storage.service_worker.service_worker_database_pb2 import \
             ServiceWorkerRegistrationData, ServiceWorkerResourceRecord
-        from pyhindsight.lib.proto.content.browser.devtools.devtools_background_services_pb2 import \
-            BackgroundServiceEvent, BackgroundService
+        from pyhindsight.lib.sw_user_data import decode_user_data
 
         def enum_name(descriptor, value):
             if value is None:
@@ -2708,74 +2707,9 @@ class Chrome(WebBrowser):
                 return None, None
             return version_id, version_to_scope.get(version_id)
 
-        # User-data dispatcher: subsystem-specific decoders for known
-        # REG_USER_DATA: keys. Each decoder returns a tuple
-        #   (subsystem_label, decoded_value_str, event_time_or_None)
-        # The optional third element surfaces an event-level timestamp (e.g.
-        # the recorded time for a DevTools background-service event) into the
-        # row's last_modified column rather than just stuffing it into the
-        # value string. Unknown keys fall through to the generic branch.
-        # Sources:
-        #   push_*           content/browser/push_messaging/push_messaging_*.cc
-        #   BackgroundSyncRegistration_*  content/browser/background_sync/
-        #   PeriodicBackgroundSyncRegistration_*  same
-        #   _notification_:  content/browser/notifications/
-        #   devtools_background_services_*  content/browser/devtools/
-        def decode_user_data(udk, value):
-            if udk in ('push_registration_id', 'push_subscription_id', 'push_endpoint'):
-                return ('push subscription', value.decode('utf-8', errors='replace'), None)
-            if udk == 'push_sender_id':
-                # P-256 raw uncompressed public key: 0x04 || X (32) || Y (32)
-                if len(value) == 65 and value[:1] == b'\x04':
-                    return ('push subscription', f'p256_application_server_key=0x{value.hex()}', None)
-                return ('push subscription', f'sender_id_bytes=0x{value.hex()}', None)
-            if udk.startswith('BackgroundSyncRegistration_'):
-                # TODO: vendor content/browser/background_sync/background_sync.proto
-                # and call BackgroundSyncRegistrationProto.ParseFromString(value).
-                return ('background sync',
-                        f'<BackgroundSyncRegistration proto, len={len(value)} bytes>', None)
-            if udk.startswith('PeriodicBackgroundSyncRegistration_'):
-                # TODO: same proto file as background sync.
-                return ('periodic sync',
-                        f'<PeriodicBackgroundSyncRegistration proto, len={len(value)} bytes>', None)
-            if udk.startswith('_notification_:'):
-                # TODO: vendor content/browser/notifications/notification_database_data.proto
-                return ('scheduled notification',
-                        f'<NotificationDatabaseData proto, len={len(value)} bytes>', None)
-            if udk.startswith('devtools_background_services_'):
-                # Format: devtools_background_services_<service_int>_<UUID>
-                # value is a content.devtools.proto.BackgroundServiceEvent.
-                # service_int echoes BackgroundServiceEvent.background_service
-                # (which subsystem the user enabled DevTools logging for).
-                evt = BackgroundServiceEvent()
-                try:
-                    evt.ParseFromString(value)
-                except Exception as e:
-                    return ('devtools event',
-                            f'<BackgroundServiceEvent decode failed: {e}>', None)
-                service_label = (BackgroundService.Name(evt.background_service).lower()
-                                 if evt.HasField('background_service') else 'unknown')
-                ts = utils.to_datetime(evt.timestamp, self.timezone) \
-                    if evt.HasField('timestamp') else None
-                pieces = []
-                if evt.HasField('event_name'):
-                    pieces.append(f'event={evt.event_name}')
-                if evt.HasField('instance_id'):
-                    pieces.append(f'instance_id={evt.instance_id}')
-                if evt.HasField('origin'):
-                    pieces.append(f'origin={evt.origin}')
-                if evt.HasField('service_worker_registration_id'):
-                    pieces.append(f'sw_reg_id={evt.service_worker_registration_id}')
-                if evt.event_metadata:
-                    meta = ', '.join(f'{k}={v}' for k, v in sorted(evt.event_metadata.items()))
-                    pieces.append(f'metadata={{{meta}}}')
-                return (f'devtools: {service_label}', '; '.join(pieces), ts)
-            # Generic fallback: try UTF-8, fall back to a hex preview.
-            try:
-                return ('user data', value.decode('utf-8'), None)
-            except UnicodeDecodeError:
-                return ('user data',
-                        f'<binary len={len(value)}, first 32 bytes=0x{value[:32].hex()}>', None)
+        # User-data dispatcher lives in pyhindsight.lib.sw_user_data; each
+        # known REG_USER_DATA: subsystem has its own decoder module. Imported
+        # at the top of this method.
 
         # Pass 2: emit records, using the maps to enrich resource rows.
         regid_to_origin_records = []
@@ -2922,7 +2856,8 @@ class Chrome(WebBrowser):
                         user_data_key = rest[nul_pos + 1:].decode('utf-8', errors='replace')
 
                     if record.value:
-                        subsystem, decoded, event_time = decode_user_data(user_data_key, record.value)
+                        subsystem, decoded, event_time = decode_user_data(
+                            user_data_key, record.value, self.timezone)
                     else:
                         subsystem, decoded, event_time = ('user data', '', None)  # deletion marker
 
@@ -3177,6 +3112,50 @@ class Chrome(WebBrowser):
                                     source_path=scf_path,
                                 ))
                                 cache_storage_count += 1
+
+                                # Dual-emit to the Timeline as a cache row.
+                                # CacheStorage entries are HTTP responses that
+                                # JS explicitly chose to cache via caches.put();
+                                # response_time is set by Chrome's network stack
+                                # and is as reliable as the HTTP cache's
+                                # response_time. The distinct row_type warns the
+                                # reader that this row reflects a deliberate JS
+                                # cache (which may be old precached content),
+                                # not an automatic HTTP cache fill.
+                                headers_dict = {}
+                                for h in meta.response.headers:
+                                    headers_dict[h.name] = h.value
+                                etag_val = ''
+                                last_mod_val = ''
+                                for hname, hval in headers_dict.items():
+                                    lname = hname.lower()
+                                    if lname == 'etag' and not etag_val:
+                                        etag_val = hval
+                                    elif lname == 'last-modified' and not last_mod_val:
+                                        last_mod_val = hval
+
+                                body_size_val = len(s1) if s1 is not None else 0
+                                mime_label = response_mime_type or 'not specified'
+                                data_summary = f'{mime_label} ({body_size_val} bytes)'
+
+                                tl_item = WebBrowser.CacheItem(
+                                    profile=self.profile_path,
+                                    url=cache_key,
+                                    title=None,
+                                    request_time=response_time,
+                                    locations=f'cache: {cache_name!r}; uuid: {cache_uuid}; file: {fname}',
+                                    key=cache_key,
+                                    metadata=None,
+                                    data=None,
+                                )
+                                tl_item.row_type = 'cache (service worker)'
+                                tl_item.data_summary = data_summary
+                                tl_item.http_headers_str = str(headers_dict) if headers_dict else ''
+                                tl_item.etag = etag_val
+                                tl_item.last_modified = last_mod_val
+                                tl_item.source_item = os.path.relpath(
+                                    scf_path, self.profile_path)
+                                self.parsed_artifacts.append(tl_item)
                     finally:
                         sc.close()
 
