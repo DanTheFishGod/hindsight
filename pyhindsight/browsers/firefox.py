@@ -1815,7 +1815,17 @@ class Firefox(WebBrowser):
 
                 source_path = os.path.relpath(ls_db, self.profile_path)
                 got_any = False
-                for seq, row in enumerate(cursor):
+                row_iter = enumerate(cursor)
+                while True:
+                    try:
+                        seq, row = next(row_iter)
+                    except StopIteration:
+                        break
+                    except Exception as e:
+                        log.warning(
+                            f' - {origin_folder}: localStorage db unreadable, '
+                            f'skipping remaining rows ({e})')
+                        break
                     key = row.get('key') or ''
                     conv = row.get('conversion_type') or 0
                     comp = row.get('compression_type') or 0
