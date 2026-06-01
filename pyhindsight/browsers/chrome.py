@@ -1121,14 +1121,6 @@ class Chrome(WebBrowser):
             self.artifacts_counts['Sessions'] = 'Failed'
             return
 
-        def webkit_ts(microseconds):
-            """Convert a Webkit/Windows epoch microsecond timestamp to a timezone-aware datetime."""
-            if microseconds == 0:
-                return utils.to_datetime(0, self.timezone)
-            ts = datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc) \
-                + datetime.timedelta(microseconds=microseconds)
-            return utils.to_datetime(ts, self.timezone)
-
         # Session file command IDs (SessionRestoreIdType)
         SESSION_TAB_CLOSED = 16
         SESSION_WINDOW_CLOSED = 17
@@ -1452,7 +1444,7 @@ class Chrome(WebBrowser):
                                     continue
                                 item = Chrome.SessionItem(
                                     self.profile_path, url='', title='',
-                                    timestamp=webkit_ts(close_time), session_id=tab_id,
+                                    timestamp=utils.to_datetime(close_time, self.timezone), session_id=tab_id,
                                     source_path=file_path)
                                 item.row_type = 'session (tab closed)'
                                 item.source_item = source_item
@@ -1466,7 +1458,7 @@ class Chrome(WebBrowser):
                                     continue
                                 item = Chrome.SessionItem(
                                     self.profile_path, url='', title='',
-                                    timestamp=webkit_ts(close_time), source_path=file_path)
+                                    timestamp=utils.to_datetime(close_time, self.timezone), source_path=file_path)
                                 item.row_type = 'session (window closed)'
                                 # For window events, session_id holds the window_id
                                 item.session_id = window_id
@@ -1481,7 +1473,7 @@ class Chrome(WebBrowser):
                                     continue
                                 item = Chrome.SessionItem(
                                     self.profile_path, url='', title='',
-                                    timestamp=webkit_ts(active_time), session_id=tab_id,
+                                    timestamp=utils.to_datetime(active_time, self.timezone), session_id=tab_id,
                                     source_path=file_path)
                                 item.row_type = 'session (tab last active)'
                                 item.source_item = source_item
@@ -1497,7 +1489,7 @@ class Chrome(WebBrowser):
                                     continue
                                 item = Chrome.SessionItem(
                                     self.profile_path, url='', title='',
-                                    timestamp=webkit_ts(close_time), session_id=tab_id,
+                                    timestamp=utils.to_datetime(close_time, self.timezone), session_id=tab_id,
                                     nav_index=nav_index, source_path=file_path)
                                 item.row_type = 'session (closed tab)'
                                 item.value = f'Navigation Index: {nav_index}'
@@ -1536,7 +1528,7 @@ class Chrome(WebBrowser):
 
                                     item = Chrome.SessionItem(
                                         self.profile_path, url='', title='',
-                                        timestamp=webkit_ts(close_time), source_path=file_path)
+                                        timestamp=utils.to_datetime(close_time, self.timezone), source_path=file_path)
                                     # For window events, store window_id as session_id for the Window ID column
                                     item.session_id = window_id
                                     item.row_type = 'session (closed window)'
@@ -2614,6 +2606,565 @@ class Chrome(WebBrowser):
         self.artifacts_counts['Platform Notifications'] = len(result_list)
         self.parsed_artifacts.extend(result_list)
 
+    def get_service_workers(self, path, dir_name):
+        """Parse service worker registrations from the Service Worker/Database LevelDB.
+
+        Decodes the ServiceWorkerRegistrationData protobuf stored under REG: keys.
+        See content/browser/service_worker/service_worker_database.proto in Chromium.
+        """
+        results = []
+
+        sw_root_path = os.path.join(path, dir_name)
+        ldb_path = os.path.join(sw_root_path, 'Database')
+        log.info('Service Workers:')
+        log.info(f' - Reading from {ldb_path}')
+
+        if not os.path.isdir(ldb_path):
+            log.error(f' - {ldb_path} is not a directory')
+            self.artifacts_counts['Service Workers'] = 'Failed'
+            return
+
+        log.info(f' - Using ccl_leveldb v{ccl_chromium_reader.storage_formats.ccl_leveldb.__version__}')
+
+        ldb_records = None
+        try:
+            ldb_records = ccl_chromium_reader.storage_formats.ccl_leveldb.RawLevelDb(pathlib.Path(ldb_path))
+        except ValueError as e:
+            log.warning(f' - Error reading records ({e}); possible LevelDB corruption')
+            self.artifacts_counts['Service Workers'] = 'Failed'
+            return
+
+        from pyhindsight.lib.proto.components.services.storage.service_worker.service_worker_database_pb2 import \
+            ServiceWorkerRegistrationData, ServiceWorkerResourceRecord
+        from pyhindsight.lib.sw_user_data import decode_user_data
+
+        def enum_name(descriptor, value):
+            if value is None:
+                return None
+            ev = descriptor.values_by_number.get(value)
+            return ev.name if ev else value
+
+        # Pass 1: scan the entire LDB to build lookup maps. PRES (purgeable)
+        # records carry only the resource_id in their key; to backfill the
+        # scope we need resource_id -> version_id (from RES:/URES: keys, even
+        # deleted ones in the log) and version_id -> scope_url (from any REG:
+        # value, live or historical). RES:/URES: scopes also benefit, since
+        # iteration order isn't guaranteed to put REG: before its resources.
+        # REG_USER_DATA: records use registration_id directly (not version_id),
+        # so we also build registration_id -> scope_url.
+        seen_reg_ids = set()
+        version_to_scope = {}
+        regid_to_scope = {}
+        resource_to_version = {}
+        # resource_id -> (url, sha256_hex_or_None) from RES:/URES: proto values.
+        # Used to enrich ScriptCache/ body rows with the URL the script was
+        # fetched from and to verify on-disk bytes against the LDB-recorded hash.
+        resource_to_record = {}
+
+        for record in ldb_records.iterate_records_raw():
+            key = record.user_key
+            if key.startswith(b'REG:'):
+                nul_pos = key.rfind(b'\x00')
+                if nul_pos > len(b'REG:'):
+                    try:
+                        seen_reg_ids.add(int(key[nul_pos + 1:]))
+                    except ValueError:
+                        pass
+                if record.value:
+                    try:
+                        reg = ServiceWorkerRegistrationData()
+                        reg.ParseFromString(record.value)
+                        version_to_scope.setdefault(reg.version_id, reg.scope_url)
+                        regid_to_scope.setdefault(reg.registration_id, reg.scope_url)
+                    except Exception:
+                        pass
+            elif key.startswith(b'RES:') or key.startswith(b'URES:'):
+                prefix_len = 4 if key.startswith(b'RES:') else 5
+                rest = key[prefix_len:]
+                nul_pos = rest.find(b'\x00')
+                if nul_pos < 0:
+                    continue
+                try:
+                    version_id = int(rest[:nul_pos])
+                    resource_id = int(rest[nul_pos + 1:])
+                except ValueError:
+                    continue
+                resource_to_version.setdefault(resource_id, version_id)
+                if record.value and resource_id not in resource_to_record:
+                    try:
+                        rr = ServiceWorkerResourceRecord()
+                        rr.ParseFromString(record.value)
+                        url = rr.url if rr.HasField('url') else None
+                        sha = rr.sha256_checksum if rr.HasField('sha256_checksum') else None
+                        resource_to_record[resource_id] = (url, sha)
+                    except Exception:
+                        pass
+
+        def scope_for_resource(resource_id, version_id=None):
+            if version_id is None:
+                version_id = resource_to_version.get(resource_id)
+            if version_id is None:
+                return None, None
+            return version_id, version_to_scope.get(version_id)
+
+        # User-data dispatcher lives in pyhindsight.lib.sw_user_data; each
+        # known REG_USER_DATA: subsystem has its own decoder module. Imported
+        # at the top of this method.
+
+        # Pass 2: emit records, using the maps to enrich resource rows.
+        regid_to_origin_records = []
+        registration_count = 0
+        resource_count = 0
+        user_data_count = 0
+
+        try:
+            for record in ldb_records.iterate_records_raw():
+                key = record.user_key
+
+                if key.startswith(b'REG:'):
+                    if not record.value:
+                        continue  # deletion marker
+
+                    reg = ServiceWorkerRegistrationData()
+                    try:
+                        reg.ParseFromString(record.value)
+                    except Exception as e:
+                        log.warning(f' - Failed to decode REG record: {e}')
+                        continue
+
+                    nav_preload_enabled = None
+                    nav_preload_header = None
+                    if reg.HasField('navigation_preload_state'):
+                        nav_preload_enabled = reg.navigation_preload_state.enabled
+                        if reg.navigation_preload_state.HasField('header'):
+                            nav_preload_header = reg.navigation_preload_state.header
+
+                    results.append(Chrome.ServiceWorkerItem(
+                        profile=self.profile_path,
+                        origin=reg.scope_url,
+                        scope_url=reg.scope_url,
+                        script_url=reg.script_url,
+                        registration_id=reg.registration_id,
+                        version_id=reg.version_id,
+                        is_active=reg.is_active,
+                        has_fetch_handler=reg.has_fetch_handler,
+                        last_update_check_time=utils.to_datetime(reg.last_update_check_time, self.timezone),
+                        resources_total_size_bytes=reg.resources_total_size_bytes if reg.HasField(
+                            'resources_total_size_bytes') else None,
+                        navigation_preload_enabled=nav_preload_enabled,
+                        navigation_preload_header=nav_preload_header,
+                        update_via_cache=enum_name(
+                            ServiceWorkerRegistrationData.ServiceWorkerUpdateViaCacheType.DESCRIPTOR,
+                            reg.update_via_cache),
+                        script_type=enum_name(
+                            ServiceWorkerRegistrationData.ServiceWorkerScriptType.DESCRIPTOR,
+                            reg.script_type),
+                        script_response_time=utils.to_datetime(reg.script_response_time, self.timezone)
+                            if reg.HasField('script_response_time') else None,
+                        seq=record.seq,
+                        state=record.state.name,
+                        source_path=str(record.origin_file),
+                    ))
+                    registration_count += 1
+
+                elif key.startswith(b'REGID_TO_ORIGIN:'):
+                    try:
+                        reg_id = int(key[len(b'REGID_TO_ORIGIN:'):])
+                    except ValueError:
+                        continue
+                    origin = record.value.decode('utf-8', errors='replace') if record.value else ''
+                    regid_to_origin_records.append((record, reg_id, origin))
+
+                elif key.startswith(b'RES:') or key.startswith(b'URES:'):
+                    is_committed = key.startswith(b'RES:')
+                    prefix = b'RES:' if is_committed else b'URES:'
+                    rest = key[len(prefix):]
+                    nul_pos = rest.find(b'\x00')
+                    if nul_pos < 0:
+                        continue
+                    try:
+                        version_id = int(rest[:nul_pos])
+                        resource_id_from_key = int(rest[nul_pos + 1:])
+                    except ValueError:
+                        continue
+
+                    url = None
+                    size_bytes = None
+                    sha256 = None
+                    if record.value:
+                        rr = ServiceWorkerResourceRecord()
+                        try:
+                            rr.ParseFromString(record.value)
+                            url = rr.url
+                            size_bytes = rr.size_bytes if rr.HasField('size_bytes') else None
+                            sha256 = rr.sha256_checksum if rr.HasField('sha256_checksum') else None
+                        except Exception as e:
+                            log.warning(f' - Failed to decode {prefix.decode()} record: {e}')
+
+                    results.append(Chrome.ServiceWorkerResourceItem(
+                        profile=self.profile_path,
+                        scope_url=version_to_scope.get(version_id),
+                        version_id=version_id,
+                        resource_id=resource_id_from_key,
+                        url=url,
+                        size_bytes=size_bytes,
+                        sha256_checksum=sha256,
+                        resource_state='committed' if is_committed else 'uncommitted',
+                        seq=record.seq,
+                        state=record.state.name,
+                        source_path=str(record.origin_file),
+                    ))
+                    resource_count += 1
+
+                elif key.startswith(b'PRES:'):
+                    # Purgeable: empty value, key carries only the resource_id.
+                    # Backfill version_id and scope from the maps built in pass 1.
+                    try:
+                        resource_id = int(key[len(b'PRES:'):])
+                    except ValueError:
+                        continue
+                    version_id, scope = scope_for_resource(resource_id)
+                    results.append(Chrome.ServiceWorkerResourceItem(
+                        profile=self.profile_path,
+                        scope_url=scope,
+                        version_id=version_id,
+                        resource_id=resource_id,
+                        url=None,
+                        size_bytes=None,
+                        sha256_checksum=None,
+                        resource_state='purgeable',
+                        seq=record.seq,
+                        state=record.state.name,
+                        source_path=str(record.origin_file),
+                    ))
+                    resource_count += 1
+
+                elif key.startswith(b'REG_USER_DATA:'):
+                    # REG_USER_DATA:<registration_id>\x00<user_data_key>
+                    # Value is opaque bytes, often a subsystem-defined protobuf.
+                    rest = key[len(b'REG_USER_DATA:'):]
+                    nul_pos = rest.find(b'\x00')
+                    if nul_pos < 0:
+                        continue
+                    try:
+                        ud_reg_id = int(rest[:nul_pos])
+                    except ValueError:
+                        continue
+                    try:
+                        user_data_key = rest[nul_pos + 1:].decode('utf-8')
+                    except UnicodeDecodeError:
+                        user_data_key = rest[nul_pos + 1:].decode('utf-8', errors='replace')
+
+                    if record.value:
+                        subsystem, decoded, event_time = decode_user_data(
+                            user_data_key, record.value, self.timezone)
+                    else:
+                        subsystem, decoded, event_time = ('user data', '', None)  # deletion marker
+
+                    item = Chrome.ServiceWorkerUserDataItem(
+                        profile=self.profile_path,
+                        scope_url=regid_to_scope.get(ud_reg_id),
+                        registration_id=ud_reg_id,
+                        user_data_key=user_data_key,
+                        subsystem=subsystem,
+                        decoded_value=decoded,
+                        raw_value_size=len(record.value) if record.value else 0,
+                        seq=record.seq,
+                        state=record.state.name,
+                        source_path=str(record.origin_file),
+                        event_time=event_time,
+                    )
+                    item.row_type = f'service worker ({subsystem})'
+                    results.append(item)
+                    user_data_count += 1
+
+            # Orphan REGID_TO_ORIGIN entries: live reverse-index records whose
+            # registration_id never appeared in any REG: key in this LDB. These
+            # indicate a SW that was registered, then had its REG: record
+            # cleaned up (or compacted away) without the reverse index also
+            # being deleted — useful "ghost" evidence.
+            orphan_count = 0
+            for rec, reg_id, origin in regid_to_origin_records:
+                if reg_id in seen_reg_ids:
+                    continue
+                if rec.state.name != 'Live':
+                    continue
+                orphan = Chrome.ServiceWorkerItem(
+                    profile=self.profile_path,
+                    origin=origin,
+                    scope_url=origin,
+                    script_url=None,
+                    registration_id=reg_id,
+                    version_id=None,
+                    is_active=None,
+                    has_fetch_handler=None,
+                    last_update_check_time=None,
+                    resources_total_size_bytes=None,
+                    navigation_preload_enabled=None,
+                    navigation_preload_header=None,
+                    update_via_cache=None,
+                    script_type=None,
+                    script_response_time=None,
+                    seq=rec.seq,
+                    state=rec.state.name,
+                    source_path=str(rec.origin_file),
+                )
+                orphan.row_type = 'service worker (orphan registration)'
+                results.append(orphan)
+                orphan_count += 1
+        finally:
+            ldb_records.close()
+
+        # ScriptCache/ extraction. Sibling directory to Database/; a Chromium
+        # simple disk_cache keyed by the resource_id (as ASCII). Lets us
+        # recover the actual SW script bytes — including for resources whose
+        # LDB rows are now Deleted/PRES: but whose bytes haven't yet been
+        # purged from disk.
+        script_cache_path = os.path.join(sw_root_path, 'ScriptCache')
+        script_count = 0
+        if os.path.isdir(script_cache_path):
+            log.info(f' - Reading ScriptCache from {script_cache_path}')
+            try:
+                sc = ccl_chromium_reader.ccl_chromium_cache.ChromiumSimpleFileCache(
+                    pathlib.Path(script_cache_path))
+            except Exception as e:
+                log.warning(f' - Could not open ScriptCache as disk_cache: {e}')
+                sc = None
+            if sc is not None:
+                try:
+                    for cache_key in sc.keys():
+                        try:
+                            resource_id = int(cache_key)
+                        except ValueError:
+                            # Non-numeric key — not a SW resource entry; skip.
+                            continue
+                        version_id = resource_to_version.get(resource_id)
+                        ldb_url, ldb_sha256 = resource_to_record.get(
+                            resource_id, (None, None))
+                        scope = version_to_scope.get(version_id) if version_id is not None else None
+
+                        # A given cache key can technically resolve to multiple
+                        # entries (hash collisions / stale entries); iterate them.
+                        try:
+                            bodies = sc.get_cachefile(cache_key)
+                            metas = sc.get_metadata(cache_key)
+                            infos = sc.get_entry_info(cache_key)
+                        except Exception as e:
+                            log.warning(f' - Failed to read ScriptCache entry {cache_key}: {e}')
+                            continue
+                        for body, meta, info in zip(bodies, metas, infos):
+                            body_sha = hashlib.sha256(body).hexdigest() if body else None
+                            sha_match = None
+                            if ldb_sha256 and body_sha:
+                                sha_match = (body_sha.lower() == ldb_sha256.lower())
+
+                            http_status = None
+                            content_type = None
+                            response_time = None
+                            request_time = None
+                            if meta is not None:
+                                try:
+                                    declarations = list(meta.http_header_declarations)
+                                    if declarations:
+                                        http_status = declarations[0]
+                                except Exception:
+                                    pass
+                                try:
+                                    for hname, hval in meta.http_header_attributes:
+                                        if hname.lower() == 'content-type':
+                                            content_type = hval
+                                            break
+                                except Exception:
+                                    pass
+                                # CachedMetadata.response_time is already a
+                                # datetime (Windows epoch == 1601-01-01 means
+                                # "not recorded"); only surface real values.
+                                if meta.response_time and meta.response_time.year > 1601:
+                                    response_time = utils.to_datetime(
+                                        meta.response_time, self.timezone)
+                                if meta.request_time and meta.request_time.year > 1601:
+                                    request_time = utils.to_datetime(
+                                        meta.request_time, self.timezone)
+
+                            results.append(Chrome.ServiceWorkerScriptItem(
+                                profile=self.profile_path,
+                                scope_url=scope,
+                                version_id=version_id,
+                                resource_id=resource_id,
+                                url=ldb_url,
+                                http_status=http_status,
+                                content_type=content_type,
+                                body_size=len(body) if body is not None else None,
+                                body_sha256=body_sha,
+                                body_sha256_match=sha_match,
+                                response_time=response_time,
+                                request_time=request_time,
+                                source_file=info.source_file if info else None,
+                                source_path=os.path.join(script_cache_path,
+                                                          info.source_file) if info else script_cache_path,
+                            ))
+                            script_count += 1
+                finally:
+                    sc.close()
+
+        # CacheStorage/ extraction. Sibling directory holding per-origin
+        # Chromium disk_caches populated by the Web Cache API (caches.put()).
+        # Layout: CacheStorage/<origin-hash>/index.txt + <UUID>/ subdirs.
+        cache_storage_path = os.path.join(sw_root_path, 'CacheStorage')
+        cache_storage_count = 0
+        if os.path.isdir(cache_storage_path):
+            log.info(f' - Reading CacheStorage from {cache_storage_path}')
+            from pyhindsight.lib.proto.content.browser.cache_storage.cache_storage_pb2 import (
+                CacheStorageIndex, CacheMetadata, CacheResponse)
+            simple_cache_file_cls = ccl_chromium_reader.ccl_chromium_cache.SimpleCacheFile
+            for origin_hash_dir in os.listdir(cache_storage_path):
+                origin_root = os.path.join(cache_storage_path, origin_hash_dir)
+                if not os.path.isdir(origin_root):
+                    continue
+                index_path = os.path.join(origin_root, 'index.txt')
+                if not os.path.isfile(index_path):
+                    continue
+                idx = CacheStorageIndex()
+                try:
+                    with open(index_path, 'rb') as f:
+                        idx.ParseFromString(f.read())
+                except Exception as e:
+                    log.warning(f' - Failed to parse {index_path}: {e}')
+                    continue
+
+                storage_key = idx.storage_key if idx.HasField('storage_key') \
+                    else (idx.origin if idx.HasField('origin') else None)
+
+                for cache_meta in idx.cache:
+                    cache_uuid = cache_meta.cache_dir if cache_meta.HasField('cache_dir') else ''
+                    if cache_meta.HasField('u16string_name'):
+                        try:
+                            cache_name = cache_meta.u16string_name.decode('utf-16-le')
+                        except UnicodeDecodeError:
+                            cache_name = cache_meta.name
+                    else:
+                        cache_name = cache_meta.name
+                    cache_subdir = os.path.join(origin_root, cache_uuid)
+                    if not os.path.isdir(cache_subdir):
+                        continue
+                    try:
+                        sc = ccl_chromium_reader.ccl_chromium_cache.ChromiumSimpleFileCache(
+                            pathlib.Path(cache_subdir))
+                    except Exception as e:
+                        log.warning(f' - Could not open {cache_subdir} as disk_cache: {e}')
+                        continue
+                    try:
+                        for cache_key in sc.keys():
+                            try:
+                                file_names = sc.get_file_for_key(cache_key)
+                            except Exception:
+                                continue
+                            for fname in file_names:
+                                scf_path = os.path.join(cache_subdir, fname)
+                                try:
+                                    scf = simple_cache_file_cls(scf_path)
+                                    s0 = scf.get_stream_0()
+                                    s1 = scf.get_stream_1()
+                                    scf.close()
+                                except Exception as e:
+                                    log.warning(f' - Failed to read {scf_path}: {e}')
+                                    continue
+
+                                meta = CacheMetadata()
+                                try:
+                                    meta.ParseFromString(s0)
+                                except Exception as e:
+                                    log.warning(
+                                        f' - Failed to parse CacheMetadata for {cache_key[:80]}: {e}')
+                                    continue
+
+                                entry_time = utils.to_datetime(meta.entry_time, self.timezone) \
+                                    if meta.HasField('entry_time') else None
+                                response_time = utils.to_datetime(
+                                    meta.response.response_time, self.timezone) \
+                                    if meta.response.HasField('response_time') else None
+                                final_url = meta.response.url_list[-1] if meta.response.url_list else None
+                                if final_url == cache_key:
+                                    final_url = None  # don't duplicate the URL when it's identical
+                                response_mime_type = meta.response.mime_type \
+                                    if meta.response.HasField('mime_type') else None
+                                body_sha = hashlib.sha256(s1).hexdigest() if s1 else None
+
+                                results.append(Chrome.ServiceWorkerCacheStorageItem(
+                                    profile=self.profile_path,
+                                    storage_key=storage_key,
+                                    origin_hash=origin_hash_dir,
+                                    cache_name=cache_name,
+                                    cache_uuid=cache_uuid,
+                                    request_url=cache_key,
+                                    request_method=meta.request.method,
+                                    response_status=meta.response.status_code,
+                                    response_status_text=meta.response.status_text,
+                                    response_type=CacheResponse.ResponseType.Name(
+                                        meta.response.response_type),
+                                    response_mime_type=response_mime_type,
+                                    final_url=final_url,
+                                    body_size=len(s1) if s1 is not None else None,
+                                    body_sha256=body_sha,
+                                    entry_time=entry_time,
+                                    response_time=response_time,
+                                    source_file=fname,
+                                    source_path=scf_path,
+                                ))
+                                cache_storage_count += 1
+
+                                # Dual-emit to the Timeline as a cache row.
+                                # CacheStorage entries are HTTP responses that
+                                # JS explicitly chose to cache via caches.put();
+                                # response_time is set by Chrome's network stack
+                                # and is as reliable as the HTTP cache's
+                                # response_time. The distinct row_type warns the
+                                # reader that this row reflects a deliberate JS
+                                # cache (which may be old precached content),
+                                # not an automatic HTTP cache fill.
+                                headers_dict = {}
+                                for h in meta.response.headers:
+                                    headers_dict[h.name] = h.value
+                                etag_val = ''
+                                last_mod_val = ''
+                                for hname, hval in headers_dict.items():
+                                    lname = hname.lower()
+                                    if lname == 'etag' and not etag_val:
+                                        etag_val = hval
+                                    elif lname == 'last-modified' and not last_mod_val:
+                                        last_mod_val = hval
+
+                                body_size_val = len(s1) if s1 is not None else 0
+                                mime_label = response_mime_type or 'not specified'
+                                data_summary = f'{mime_label} ({body_size_val} bytes)'
+
+                                tl_item = WebBrowser.CacheItem(
+                                    profile=self.profile_path,
+                                    url=cache_key,
+                                    title=None,
+                                    request_time=response_time,
+                                    locations=f'cache: {cache_name!r}; uuid: {cache_uuid}; file: {fname}',
+                                    key=cache_key,
+                                    metadata=None,
+                                    data=None,
+                                )
+                                tl_item.row_type = 'cache (service worker)'
+                                tl_item.data_summary = data_summary
+                                tl_item.http_headers_str = str(headers_dict) if headers_dict else ''
+                                tl_item.etag = etag_val
+                                tl_item.last_modified = last_mod_val
+                                tl_item.source_item = os.path.relpath(
+                                    scf_path, self.profile_path)
+                                self.parsed_artifacts.append(tl_item)
+                    finally:
+                        sc.close()
+
+        log.info(f' - Parsed {registration_count} registration records, '
+                 f'{resource_count} resource records, {user_data_count} user-data records, '
+                 f'{orphan_count} orphan registrations, {script_count} script bodies, '
+                 f'{cache_storage_count} cache storage entries')
+        self.artifacts_counts['Service Workers'] = len(results)
+        self.parsed_storage.extend(results)
 
     def get_cache(self, path, dir_name, row_type=None):
         # Set up empty return array
@@ -3115,7 +3666,7 @@ class Chrome(WebBrowser):
         items = utils.get_ldb_records(sc_root_path)
         for item in items:
             try:
-                from pyhindsight.lib.site_data_pb2 import SiteDataProto
+                from pyhindsight.lib.proto.components.performance_manager.persistence.site_data.site_data_pb2 import SiteDataProto
 
                 if item['key'] == b'database_metadata':
                     if item['value'] != b'1':
@@ -3172,15 +3723,15 @@ class Chrome(WebBrowser):
 
         items = utils.get_ldb_records(sync_data_root_path)
 
-        from pyhindsight.lib.buf.components.sync.protocol.device_info_specifics_pb2 import DeviceInfoSpecifics
-        from pyhindsight.lib.buf.components.sync.protocol.session_specifics_pb2 import SessionSpecifics
-        from pyhindsight.lib.buf.components.sync.protocol.entity_metadata_pb2 import EntityMetadata
-        from pyhindsight.lib.buf.components.sync.protocol.data_type_state_pb2 import DataTypeState
-        from pyhindsight.lib.buf.components.sync.protocol.user_event_specifics_pb2 import UserEventSpecifics
-        from pyhindsight.lib.buf.components.sync.protocol.app_specifics_pb2 import AppSpecifics
-        from pyhindsight.lib.buf.components.sync.protocol.user_consent_specifics_pb2 import UserConsentSpecifics
-        from pyhindsight.lib.buf.components.sync.protocol.persisted_entity_data_pb2 import PersistedEntityData
-        from pyhindsight.lib.buf.components.sync.protocol.sync_enums_pb2 import SyncEnums
+        from pyhindsight.lib.proto.components.sync.protocol.device_info_specifics_pb2 import DeviceInfoSpecifics
+        from pyhindsight.lib.proto.components.sync.protocol.session_specifics_pb2 import SessionSpecifics
+        from pyhindsight.lib.proto.components.sync.protocol.entity_metadata_pb2 import EntityMetadata
+        from pyhindsight.lib.proto.components.sync.protocol.data_type_state_pb2 import DataTypeState
+        from pyhindsight.lib.proto.components.sync.protocol.user_event_specifics_pb2 import UserEventSpecifics
+        from pyhindsight.lib.proto.components.sync.protocol.app_specifics_pb2 import AppSpecifics
+        from pyhindsight.lib.proto.components.sync.protocol.user_consent_specifics_pb2 import UserConsentSpecifics
+        from pyhindsight.lib.proto.components.sync.protocol.persisted_entity_data_pb2 import PersistedEntityData
+        from pyhindsight.lib.proto.components.sync.protocol.sync_enums_pb2 import SyncEnums
 
         os_type_labels = {
             'OS_TYPE_UNSPECIFIED': 'Unspecified',
@@ -3452,7 +4003,7 @@ class Chrome(WebBrowser):
         supported_databases = ['History', 'Archived History', 'Media History', 'Web Data', 'Cookies',
                                'Login Data', 'Login Data For Account'
                                'Extension Cookies', 'Network Action Predictor', 'DIPS']
-        supported_subdirs = ['Local Storage', 'Extensions', 'File System', 'Platform Notifications', 'Network', 'Sessions']
+        supported_subdirs = ['Local Storage', 'Extensions', 'File System', 'Platform Notifications', 'Network', 'Sessions', 'Service Worker']
         supported_jsons = ['Bookmarks', 'TransportSecurity']  # , 'Preferences']
         supported_items = supported_databases + supported_subdirs + supported_jsons
         log.debug(f'Supported items: {supported_items}')
@@ -3702,6 +4253,12 @@ class Chrome(WebBrowser):
                     'Platform Notifications', 'Platform Notifications', self.get_platform_notifications,
                     self.profile_path, 'Platform Notifications',
                     display_key='Platform Notifications', display_value='Platform Notification records')
+
+            if 'Service Worker' in input_listing:
+                run_with_status(
+                    'Service Workers', 'Service Workers', self.get_service_workers,
+                    self.profile_path, 'Service Worker',
+                    display_key='Service Workers', display_value='Service Worker registrations')
 
             # Browser Extensions
             current_group = "Browser Extensions"
