@@ -1404,6 +1404,9 @@ class AnalysisSession(object):
         # Start at the row after the headers, and begin writing out the items in parsed_artifacts
         row_number = 2
         for item in self.parsed_storage:
+            if item.row_type.startswith("service worker"):
+                # Rendered on the dedicated Service Workers sheet below.
+                continue
             try:
                 if item.row_type.startswith("file system"):
                     s.write_string(row_number, 0, item.row_type, black_type_format)
@@ -1464,6 +1467,472 @@ class AnalysisSession(object):
         # Formatting
         s.freeze_panes(2, 0)  # Freeze top row
         s.autofilter(1, 0, row_number, 12)  # Add autofilter
+
+        #########################################
+        # Service Workers worksheet
+        #########################################
+        sw = workbook.add_worksheet('Service Workers')
+        used_sheet_names.add('service workers')
+
+        # Title bar
+        sw.merge_range('A1:G1', f'Hindsight Internet History Forensics (v{__version__}) - Service Workers',
+                       title_header_format)
+        sw.merge_range('H1:K1', 'IDs', center_header_format)
+        sw.merge_range('L1:S1', 'Registration', center_header_format)
+        sw.merge_range('T1:AD1', 'HTTP / Body', center_header_format)
+        sw.merge_range('AE1:AF1', 'CacheStorage', center_header_format)
+        sw.merge_range('AG1:AH1', 'Secondary Times', center_header_format)
+        sw.merge_range('AI1:AJ1', 'LDB Record', center_header_format)
+
+        # Body Size (on-disk) and Resource Size (LDB) are paired; same for the
+        # two SHA256 columns. On a merged Resource+Body row both pairs are
+        # populated; the SHA256 Match cell flags any drift between the LDB-
+        # recorded hash and the bytes actually on disk.
+        sw_columns = [
+            ('Type', 22),
+            ('Scope / Origin', 35),
+            ('Key', 45),
+            ('Value', 50),
+            (f'Modification Time ({self.timezone})', 22),
+            ('Profile', 30),
+            ('Source Item', 30),
+            ('Registration ID', 10),
+            ('Version ID', 10),
+            ('Resource ID', 10),
+            ('Resource State', 12),
+            ('Is Active', 9),
+            ('Has Fetch Handler', 11),
+            ('Script Type', 11),
+            ('Update Via Cache', 12),
+            ('Nav Preload Enabled', 11),
+            ('Nav Preload Header', 20),
+            ('Total Resource Size (bytes)', 14),
+            (f'Script Response Time ({self.timezone})', 22),
+            ('HTTP Status', 14),
+            ('Content / MIME Type', 22),
+            ('Request Method', 9),
+            ('Response Status', 10),
+            ('Response Type', 16),
+            ('Final URL', 40),
+            ('Body Size (on-disk)', 12),
+            ('Resource Size (LDB)', 12),
+            ('Body SHA256 (on-disk)', 30),
+            ('LDB SHA256', 30),
+            ('SHA256 Match', 11),
+            ('Cache Name', 30),
+            ('Cache UUID', 36),
+            (f'Response Time ({self.timezone})', 22),
+            (f'Request Time ({self.timezone})', 22),
+            ('Sequence', 8),
+            ('State', 8),
+        ]
+        for col_idx, (header, width) in enumerate(sw_columns):
+            sw.write(1, col_idx, header, header_format)
+            sw.set_column(col_idx, col_idx, width)
+
+        # Nested layout: Origin -> Registration -> Resource -> Script Body,
+        # with User Data and Cache Storage as per-origin sub-sections. Mirrors
+        # Chromium's data model so investigators can read each SW's lifecycle
+        # top-to-bottom. Historical LDB log entries (older Live rows, Deleted
+        # tombstones) render inline in gray italics under their primary row.
+
+        # Per-sheet formats (depth + style combinations).
+        sw_origin_header_fmt = workbook.add_format({
+            'font_color': 'white', 'bg_color': '#595959', 'bold': True, 'align': 'left'})
+        sw_section_fmt = workbook.add_format({
+            'font_color': 'white', 'bg_color': '#808080', 'bold': True,
+            'italic': True, 'align': 'left'})
+        sw_cache_name_fmt = workbook.add_format({
+            'font_color': 'black', 'bg_color': '#E7E6E6', 'bold': True,
+            'italic': True, 'indent': 1, 'align': 'left'})
+
+        reg_type_fmt = workbook.add_format(
+            {'font_color': 'black', 'bold': True, 'indent': 1, 'align': 'left'})
+        reg_type_hist_fmt = workbook.add_format(
+            {'font_color': 'gray', 'italic': True, 'indent': 1, 'align': 'left'})
+        res_type_fmt = workbook.add_format(
+            {'font_color': 'black', 'indent': 2, 'align': 'left'})
+        res_type_hist_fmt = workbook.add_format(
+            {'font_color': 'gray', 'italic': True, 'indent': 2, 'align': 'left'})
+        body_type_fmt = workbook.add_format(
+            {'font_color': 'black', 'indent': 3, 'align': 'left'})
+        body_type_mismatch_fmt = workbook.add_format(
+            {'font_color': 'red', 'bold': True, 'indent': 3, 'align': 'left'})
+        ud_type_fmt = workbook.add_format(
+            {'font_color': 'black', 'indent': 2, 'align': 'left'})
+        ud_type_hist_fmt = workbook.add_format(
+            {'font_color': 'gray', 'italic': True, 'indent': 2, 'align': 'left'})
+        cache_entry_fmt = workbook.add_format(
+            {'font_color': 'black', 'indent': 3, 'align': 'left'})
+
+        def _g(item, name):
+            return getattr(item, name, None)
+
+        sw_rows = [it for it in self.parsed_storage if it.row_type.startswith('service worker')]
+
+        # version_id -> registration_id, derived from registration rows. Lets
+        # us nest resources (which only carry version_id) under the right reg.
+        version_to_reg = {}
+        for it in sw_rows:
+            if it.row_type == 'service worker (registration)':
+                v = _g(it, 'version_id')
+                r = _g(it, 'registration_id')
+                if v is not None and r is not None:
+                    version_to_reg.setdefault(v, r)
+
+        # Build the per-origin tree.
+        from collections import defaultdict
+        origins = defaultdict(lambda: {
+            'reg_groups': defaultdict(list),      # (reg_id, version_id) -> rows
+            'orphans': [],
+            'detached_resources': defaultdict(lambda: defaultdict(list)),  # version -> res_id -> rows
+            'user_data': [],
+            'caches': defaultdict(list),          # cache_name -> rows
+        })
+        body_by_resource = defaultdict(list)     # resource_id -> [script body items]
+
+        for it in sw_rows:
+            rt = it.row_type
+            origin = it.origin or '(unknown origin)'
+            if rt == 'service worker (registration)':
+                key = (_g(it, 'registration_id'), _g(it, 'version_id'))
+                origins[origin]['reg_groups'][key].append(it)
+            elif rt == 'service worker (orphan registration)':
+                origins[origin]['orphans'].append(it)
+            elif rt == 'service worker (resource)':
+                v = _g(it, 'version_id')
+                reg_id = version_to_reg.get(v)
+                if reg_id is not None:
+                    origins[origin]['reg_groups'][(reg_id, v)].append(it)
+                else:
+                    origins[origin]['detached_resources'][v][_g(it, 'resource_id')].append(it)
+            elif rt == 'service worker (script body)':
+                res_id = _g(it, 'resource_id')
+                body_by_resource[res_id].append(it)
+            elif rt == 'service worker (cache storage)':
+                name = _g(it, 'cache_name') or '(unnamed cache)'
+                origins[origin]['caches'][name].append(it)
+            else:
+                # user data (push subscription, devtools events, sync stubs, etc.)
+                origins[origin]['user_data'].append(it)
+
+        # Friendly Type column labels per row_type.
+        def _type_label(it):
+            rt = it.row_type
+            if rt == 'service worker (registration)':
+                return 'Registration'
+            if rt == 'service worker (orphan registration)':
+                return 'Registration (orphan)'
+            if rt == 'service worker (resource)':
+                return 'Resource'
+            if rt == 'service worker (script body)':
+                return 'Script Body'
+            if rt == 'service worker (cache storage)':
+                return 'Cache Entry'
+            # user data variants: strip the "service worker (" prefix
+            if rt.startswith('service worker (') and rt.endswith(')'):
+                return rt[len('service worker ('):-1].title()
+            return rt
+
+        def write_row(row, item, type_fmt, body_value_fmt, body_date_fmt, body_url_fmt,
+                      body=None):
+            """Emit one item row using the supplied formats. If `body` is supplied
+            (Resource + Script Body merge), body-derived fields (HTTP status,
+            on-disk size+hash, response/request times) come from the body item
+            while LDB-recorded fields stay on `item`. Cells stay blank when the
+            field doesn't apply to either."""
+            # Body-derived fields fall back to `item` when no body is supplied.
+            # That's how standalone Script Body rows (orphans) work — they pass
+            # the script-body item as `item` directly.
+            bsrc = body if body is not None else item
+
+            # When merging in a body, prefer its response_time as Modification
+            # Time (it's the most actionable timestamp for "when this body was
+            # fetched"); otherwise keep the item's own last_modified.
+            mod_time = item.last_modified
+            if body is not None and _g(body, 'response_time'):
+                mod_time = body.response_time
+
+            sw.write_string(row, 0, _type_label(item), type_fmt)
+            sw.write_string(row, 1, item.origin or '', body_url_fmt)
+            sw.write_string(row, 2, item.key or '', body_value_fmt)
+            sw.write(row, 3, item.value or '', body_value_fmt)
+            sw.write(row, 4, friendly_date(mod_time), body_date_fmt)
+            sw.write_string(row, 5, item.profile or '', body_value_fmt)
+            # Source Item = path relative to Profile (Timeline convention).
+            source_display = item.source_path or ''
+            if source_display and item.profile:
+                try:
+                    rel = os.path.relpath(source_display, item.profile)
+                    if not rel.startswith('..'):
+                        source_display = rel
+                except ValueError:
+                    pass  # different drives on Windows -> keep absolute path
+            sw.write_string(row, 6, source_display, body_value_fmt)
+
+            reg_id = _g(item, 'registration_id')
+            if reg_id is not None:
+                sw.write_number(row, 7, reg_id, body_value_fmt)
+            ver_id = _g(item, 'version_id')
+            if ver_id is None and body is not None:
+                ver_id = _g(body, 'version_id')
+            if ver_id is not None:
+                sw.write_number(row, 8, ver_id, body_value_fmt)
+            res_id = _g(item, 'resource_id')
+            if res_id is None and body is not None:
+                res_id = _g(body, 'resource_id')
+            if res_id is not None:
+                sw.write_number(row, 9, res_id, body_value_fmt)
+            if _g(item, 'resource_state'):
+                sw.write_string(row, 10, item.resource_state, body_value_fmt)
+
+            # Booleans rendered as text so historical/gray formats apply uniformly.
+            is_active = _g(item, 'is_active')
+            if is_active is not None:
+                sw.write_string(row, 11, 'Yes' if is_active else 'No', body_value_fmt)
+            hfh = _g(item, 'has_fetch_handler')
+            if hfh is not None:
+                sw.write_string(row, 12, 'Yes' if hfh else 'No', body_value_fmt)
+            if _g(item, 'script_type'):
+                sw.write_string(row, 13, item.script_type, body_value_fmt)
+            if _g(item, 'update_via_cache'):
+                sw.write_string(row, 14, item.update_via_cache, body_value_fmt)
+            npe = _g(item, 'navigation_preload_enabled')
+            if npe is not None:
+                sw.write_string(row, 15, 'Yes' if npe else 'No', body_value_fmt)
+            if _g(item, 'navigation_preload_header'):
+                sw.write_string(row, 16, item.navigation_preload_header, body_value_fmt)
+            rts = _g(item, 'resources_total_size_bytes')
+            if rts is not None:
+                sw.write_number(row, 17, rts, body_value_fmt)
+            if _g(item, 'script_response_time'):
+                sw.write(row, 18, friendly_date(item.script_response_time), body_date_fmt)
+
+            # HTTP / response fields — from bsrc (body when merging, else item).
+            if _g(bsrc, 'http_status'):
+                sw.write_string(row, 19, str(bsrc.http_status), body_value_fmt)
+            content_type = _g(bsrc, 'content_type') or _g(bsrc, 'response_mime_type')
+            if content_type:
+                sw.write_string(row, 20, content_type, body_value_fmt)
+            if _g(bsrc, 'request_method'):
+                sw.write_string(row, 21, bsrc.request_method, body_value_fmt)
+            rs = _g(bsrc, 'response_status')
+            if rs is not None:
+                status_str = f'{rs} {_g(bsrc, "response_status_text") or ""}'.strip()
+                sw.write_string(row, 22, status_str, body_value_fmt)
+            if _g(bsrc, 'response_type'):
+                sw.write_string(row, 23, bsrc.response_type, body_value_fmt)
+            if _g(bsrc, 'final_url'):
+                sw.write_string(row, 24, bsrc.final_url, body_url_fmt)
+
+            # Size + SHA256 column pairs: on-disk values (from bsrc) and
+            # LDB-recorded values (from item) shown side-by-side so investigators
+            # can spot drift even without an explicit MISMATCH flag.
+            disk_size = _g(bsrc, 'body_size')
+            if disk_size is not None:
+                sw.write_number(row, 25, disk_size, body_value_fmt)
+            ldb_size = _g(item, 'size_bytes')
+            if ldb_size is not None:
+                sw.write_number(row, 26, ldb_size, body_value_fmt)
+            disk_sha = _g(bsrc, 'body_sha256')
+            if disk_sha:
+                sw.write_string(row, 27, disk_sha, body_value_fmt)
+            ldb_sha = _g(item, 'sha256_checksum')
+            if ldb_sha:
+                sw.write_string(row, 28, ldb_sha, body_value_fmt)
+            sha_match = _g(bsrc, 'body_sha256_match')
+            if sha_match is True:
+                sw.write_string(row, 29, 'Yes', body_value_fmt)
+            elif sha_match is False:
+                # Force red for mismatches even on otherwise-gray historical rows;
+                # this is the highest-priority forensic signal on the sheet.
+                sw.write_string(row, 29, 'MISMATCH', red_value_format)
+
+            if _g(item, 'cache_name'):
+                sw.write_string(row, 30, item.cache_name, body_value_fmt)
+            if _g(item, 'cache_uuid'):
+                sw.write_string(row, 31, item.cache_uuid, body_value_fmt)
+
+            rt = _g(bsrc, 'response_time')
+            # Don't duplicate when response_time is already in Modification Time.
+            if rt and rt is not mod_time:
+                sw.write(row, 32, friendly_date(rt), body_date_fmt)
+            req_t = _g(bsrc, 'request_time')
+            if req_t:
+                sw.write(row, 33, friendly_date(req_t), body_date_fmt)
+
+            seq = _g(item, 'seq')
+            if seq is not None:
+                sw.write_number(row, 34, seq, body_value_fmt)
+            if _g(item, 'state'):
+                sw.write_string(row, 35, item.state, body_value_fmt)
+
+        # Walk the tree and emit rows.
+        sw_row = 2
+        last_col = len(sw_columns) - 1
+
+        def emit_log_group(items, primary_fmt, historical_fmt):
+            """Render a group of LDB log entries sharing a logical key. Highest-seq
+            Live row is the primary (full color); the rest are historical (gray
+            italic)."""
+            nonlocal sw_row
+            items.sort(key=lambda x: -(getattr(x, 'seq', 0) or 0))
+            primary_emitted = False
+            for it in items:
+                is_primary = (not primary_emitted) and (getattr(it, 'state', None) == 'Live')
+                if is_primary:
+                    primary_emitted = True
+                    write_row(sw_row, it, primary_fmt,
+                              black_value_format, black_date_format, black_url_format)
+                else:
+                    write_row(sw_row, it, historical_fmt,
+                              gray_value_format, gray_date_format, gray_url_format)
+                sw_row += 1
+            # If nothing was Live, every row stays gray — accurately reflecting
+            # that the registration/resource has been removed from the LDB.
+
+        def emit_resource_group(res_list, body_list):
+            """Emit one resource_id's log entries, merging its ScriptCache body
+            (if any) onto the primary Live row. Historical resource entries are
+            never body-merged (the body reflects current state only). If no
+            Live row exists, the body — if present — emits as its own row at
+            resource depth."""
+            nonlocal sw_row
+            res_list.sort(key=lambda x: -(getattr(x, 'seq', 0) or 0))
+            # Typically one body per resource_id; multiple only on hash
+            # collisions or stale disk_cache entries. Merge the first, emit
+            # any extras as standalone rows after the group.
+            primary_body = body_list[0] if body_list else None
+            extra_bodies = body_list[1:] if body_list else []
+
+            primary_emitted = False
+            for it in res_list:
+                is_primary = (not primary_emitted) and (getattr(it, 'state', None) == 'Live')
+                if is_primary:
+                    primary_emitted = True
+                    write_row(sw_row, it, res_type_fmt,
+                              black_value_format, black_date_format, black_url_format,
+                              body=primary_body)
+                    sw_row += 1
+                    primary_body = None  # consumed by the merge
+                else:
+                    write_row(sw_row, it, res_type_hist_fmt,
+                              gray_value_format, gray_date_format, gray_url_format)
+                    sw_row += 1
+
+            # Body couldn't be merged (every resource log entry was Deleted /
+            # tombstoned) — emit it on its own so the recovered bytes aren't
+            # hidden.
+            if primary_body is not None:
+                write_row(sw_row, primary_body, res_type_fmt,
+                          black_value_format, black_date_format, black_url_format)
+                sw_row += 1
+            for eb in extra_bodies:
+                write_row(sw_row, eb, res_type_fmt,
+                          black_value_format, black_date_format, black_url_format)
+                sw_row += 1
+
+        for origin in sorted(origins.keys()):
+            data = origins[origin]
+            # Origin merged bar
+            sw.merge_range(sw_row, 0, sw_row, last_col, origin, sw_origin_header_fmt)
+            sw_row += 1
+
+            # Sort registration groups: by reg_id asc, then version_id desc
+            # (newest version first under each registration).
+            sorted_reg_keys = sorted(
+                data['reg_groups'].keys(),
+                key=lambda k: ((k[0] is None, k[0] or 0), -(k[1] or 0)))
+            for reg_key in sorted_reg_keys:
+                rows_in_group = data['reg_groups'][reg_key]
+                reg_items = [r for r in rows_in_group
+                             if r.row_type == 'service worker (registration)']
+                res_items = [r for r in rows_in_group
+                             if r.row_type == 'service worker (resource)']
+
+                if reg_items:
+                    emit_log_group(reg_items, reg_type_fmt, reg_type_hist_fmt)
+
+                # Resources for this version, grouped by resource_id. Each
+                # resource_id's primary (highest-seq Live) row is merged with
+                # its ScriptCache body so a single row carries both LDB-recorded
+                # and on-disk fields. Historical resource log entries stay
+                # un-merged in gray italic. Bodies with no matching Live row
+                # emit as their own row at resource depth.
+                res_by_id = defaultdict(list)
+                for r in res_items:
+                    res_by_id[_g(r, 'resource_id')].append(r)
+                for res_id in sorted(res_by_id.keys(), key=lambda x: (x is None, x or 0)):
+                    emit_resource_group(res_by_id[res_id], body_by_resource.pop(res_id, []))
+
+            # Orphan REGID_TO_ORIGIN registrations (REG: was cleaned up).
+            for orph in data['orphans']:
+                write_row(sw_row, orph, reg_type_fmt,
+                          black_value_format, black_date_format, black_url_format)
+                sw_row += 1
+
+            # Detached resources whose version_id never had a REG: record in this LDB.
+            if data['detached_resources']:
+                sw.merge_range(sw_row, 0, sw_row, last_col,
+                               '─ Detached resources (no matching registration) ─',
+                               sw_section_fmt)
+                sw_row += 1
+                for v_id in sorted(data['detached_resources'].keys(),
+                                   key=lambda x: (x is None, -(x or 0))):
+                    res_by_id = data['detached_resources'][v_id]
+                    for res_id in sorted(res_by_id.keys(), key=lambda x: (x is None, x or 0)):
+                        emit_resource_group(res_by_id[res_id],
+                                            body_by_resource.pop(res_id, []))
+
+            # User-data sub-section (push, devtools events, sync stubs, etc.)
+            if data['user_data']:
+                sw.merge_range(sw_row, 0, sw_row, last_col, '─ User Data ─', sw_section_fmt)
+                sw_row += 1
+                # Group by (registration_id, user_data_key) so multi-log-entry
+                # subsystems collapse historical rows in gray.
+                ud_groups = defaultdict(list)
+                for ud in data['user_data']:
+                    ud_groups[(_g(ud, 'registration_id'), _g(ud, 'user_data_key'))].append(ud)
+                for k in sorted(ud_groups.keys(),
+                                key=lambda x: ((x[0] is None, x[0] or 0), x[1] or '')):
+                    emit_log_group(ud_groups[k], ud_type_fmt, ud_type_hist_fmt)
+
+            # Cache Storage sub-section
+            if data['caches']:
+                sw.merge_range(sw_row, 0, sw_row, last_col, '─ Cache Storage ─', sw_section_fmt)
+                sw_row += 1
+                for cname in sorted(data['caches'].keys()):
+                    entries = data['caches'][cname]
+                    uuid = _g(entries[0], 'cache_uuid') if entries else ''
+                    label = f'Cache "{cname}"' + (f'    ({uuid})' if uuid else '')
+                    sw.merge_range(sw_row, 0, sw_row, last_col, label, sw_cache_name_fmt)
+                    sw_row += 1
+                    # CacheStorage entries don't have an LDB seq; sort by entry_time.
+                    entries.sort(key=lambda e: _g(e, 'entry_time') or 0, reverse=True)
+                    for entry in entries:
+                        write_row(sw_row, entry, cache_entry_fmt,
+                                  black_value_format, black_date_format, black_url_format)
+                        sw_row += 1
+
+            # Blank row between origins for visual separation.
+            sw_row += 1
+
+        # Script bodies whose resource_id never appeared in any RES:/URES: log
+        # entry — "ghost bodies" recovered from ScriptCache/ alone.
+        ghosts = [b for blist in body_by_resource.values() for b in blist]
+        if ghosts:
+            sw.merge_range(sw_row, 0, sw_row, last_col,
+                           'Orphaned Script Bodies  (recovered from ScriptCache/ — no matching LDB resource record)',
+                           sw_origin_header_fmt)
+            sw_row += 1
+            for b in ghosts:
+                mismatch = _g(b, 'body_sha256_match') is False
+                fmt = body_type_mismatch_fmt if mismatch else body_type_fmt
+                write_row(sw_row, b, fmt,
+                          black_value_format, black_date_format, black_url_format)
+                sw_row += 1
+
+        sw.freeze_panes(2, 0)
 
         #########################################
         # Extension Data worksheet

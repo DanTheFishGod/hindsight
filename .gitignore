@@ -14,3 +14,4 @@ pyhindsight/static/web_modules/
 *.xlsx
 .claude/
 hindsight-temp/
+data-sets/
