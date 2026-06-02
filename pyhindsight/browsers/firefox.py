@@ -1512,7 +1512,168 @@ class Firefox(WebBrowser):
             conn.close()
 
     @staticmethod
-    def _parse_cache2_entry(path):
+    def _parse_cache2_meta_at(hdr):
+        # Parse a metadata header tuple starting at the byte immediately after
+        # the u32 CRC. Returns (fields_dict, header_size) or None.
+        if len(hdr) < 28:
+            return None
+        try:
+            version, fetch_count, last_fetched, last_modified, frecency, expiration, key_size = \
+                struct.unpack('>IIIIIII', hdr[:28])
+        except struct.error:
+            return None
+        if version >= 2:
+            if len(hdr) < 32:
+                return None
+            flags = struct.unpack('>I', hdr[28:32])[0]
+            header_size = 32
+        else:
+            flags = None
+            header_size = 28
+        if key_size == 0 or key_size > 64 * 1024:
+            return None
+        if header_size + key_size + 1 > len(hdr):
+            return None
+        return ({
+            'version': version,
+            'fetch_count': fetch_count,
+            'last_fetched': last_fetched,
+            'last_modified': last_modified,
+            'frecency': frecency,
+            'expiration': expiration if expiration else None,
+            'flags': flags,
+            'key_size': key_size,
+        }, header_size)
+
+    @staticmethod
+    def _parse_cache2_elements(blob):
+        # response-head is itself a CRLF-joined HTTP block stored under the
+        # name 'response-head'. Other names (last-accessed, frecency, etc.)
+        # are short scalars.
+        elements = {}
+        parts = blob.split(b'\x00')
+        i = 0
+        while i + 1 < len(parts):
+            name = parts[i].decode('utf-8', errors='replace')
+            value = parts[i + 1].decode('utf-8', errors='replace')
+            if name:
+                elements[name] = value
+            i += 2
+        return elements
+
+    @staticmethod
+    def _split_response_head(response_head):
+        status_line = None
+        headers = {}
+        if response_head:
+            lines = response_head.replace('\r\n', '\n').split('\n')
+            status_line = lines[0].strip() if lines else None
+            for line in lines[1:]:
+                if ':' not in line:
+                    continue
+                name, _, value = line.partition(':')
+                if name.strip():
+                    headers[name.strip().lower()] = value.strip()
+        return status_line, headers
+
+    # Best-effort regex-based recovery for entries whose metadata block has
+    # been zeroed or corrupted by forensic acquisition. We try to pull a URL,
+    # partition key, HTTP response headers, and net-response-time telemetry
+    # straight out of the file's bytes.
+    _CACHE2_KEY_URL_RE = re.compile(rb'(?:[\t:])(https?://[\x21-\x7e]{3,2000})')
+    _CACHE2_PART_KEY_RE = re.compile(rb'\^partitionKey=%28([^%]+)%2C([^%]+)%29')
+    _CACHE2_HEADER_RE = re.compile(
+        rb'(content-type|content-length|content-encoding|cache-control|'
+        rb'date|etag|last-modified|server|location|set-cookie|vary|age|expires|'
+        rb'strict-transport-security|x-content-type-options|x-frame-options):'
+        rb'\s*([^\r\n\x00]{1,500})', re.IGNORECASE)
+    _CACHE2_TIMING_RE = re.compile(rb'net-response-time-on(start|stop)\x00(\d{1,8})')
+    _CACHE2_STATUSLINE_RE = re.compile(rb'HTTP/1\.[01] (\d{3})')
+
+    @classmethod
+    def _cache2_regex_recover(cls, buf):
+        out = {}
+        m = cls._CACHE2_KEY_URL_RE.search(buf)
+        if m:
+            out['url'] = m.group(1).rstrip(b'\x00').decode(
+                'utf-8', errors='replace')
+        pk = cls._CACHE2_PART_KEY_RE.search(buf)
+        if pk:
+            out['partition_scheme'] = pk.group(1).decode(
+                'utf-8', errors='replace')
+            out['partition_host'] = pk.group(2).decode(
+                'utf-8', errors='replace')
+        headers = {}
+        for name, value in cls._CACHE2_HEADER_RE.findall(buf):
+            k = name.lower().decode('ascii')
+            v = value.decode('utf-8', errors='replace').strip()
+            if k not in headers and v:
+                headers[k] = v
+        if headers:
+            out['headers'] = headers
+        timing = {}
+        for phase, ms in cls._CACHE2_TIMING_RE.findall(buf):
+            timing[phase.decode('ascii')] = int(ms)
+        if timing:
+            out['timing'] = timing
+        sl = cls._CACHE2_STATUSLINE_RE.search(buf)
+        if sl:
+            out['status'] = int(sl.group(1))
+        return out
+
+    @classmethod
+    def _cache2_backscan_meta(cls, buf):
+        # When the trailer u32 is corrupt or key_size is garbage, the real
+        # metadata block may still be intact inside the file. The block starts
+        # with u32 CRC | u32 version (small int: 1, 2, or 3). Look for those
+        # version bytes in the back half and validate the candidate header.
+        size = len(buf)
+        if size < 64:
+            return None
+        start = size // 2
+        # 2010-01-01 to 2100-01-01 in Unix seconds: timestamps outside this
+        # range almost always indicate we landed on a random byte, not real
+        # metadata.
+        TS_LO, TS_HI = 1262304000, 4102444800
+        for ver in (3, 2, 1):
+            needle = b'\x00\x00\x00' + bytes([ver])
+            pos = buf.find(needle, start)
+            while pos != -1:
+                ms = pos - 4
+                if ms < 0:
+                    pos = buf.find(needle, pos + 1)
+                    continue
+                meta = cls._parse_cache2_meta_at(buf[ms + 4:])
+                if meta is None:
+                    pos = buf.find(needle, pos + 1)
+                    continue
+                fields, header_size = meta
+                if fields['version'] != ver:
+                    pos = buf.find(needle, pos + 1)
+                    continue
+                lf = fields['last_fetched']
+                lm = fields['last_modified']
+                if not (lf == 0 or TS_LO <= lf <= TS_HI):
+                    pos = buf.find(needle, pos + 1)
+                    continue
+                if not (lm == 0 or TS_LO <= lm <= TS_HI):
+                    pos = buf.find(needle, pos + 1)
+                    continue
+                key_off = ms + 4 + header_size
+                key_size = fields['key_size']
+                key_bytes = buf[key_off:key_off + key_size]
+                # Require a URL marker so we don't latch onto a coincidental
+                # version-tag run.
+                if b'http' not in key_bytes:
+                    pos = buf.find(needle, pos + 1)
+                    continue
+                elements_blob = buf[key_off + key_size + 1:-4]
+                return fields, key_bytes, elements_blob, ms
+            # else: keep searching for older versions
+        return None
+
+    @classmethod
+    def _parse_cache2_entry(cls, path):
         # Layout (big-endian throughout):
         #   [body, length=meta_offset] [chunk_hashes, 2B per CHUNK_SIZE chunk]
         #   [metadata block] [uint32 meta_offset trailer]
@@ -1529,16 +1690,19 @@ class Firefox(WebBrowser):
         try:
             with open(path, 'rb') as fh:
                 # Multi-MB entries: seek to the metadata block instead of slurping
-                # gigabytes of cached video into memory.
+                # gigabytes of cached video into memory. The strict-parse path
+                # avoids reading the whole file; the recovery path needs it.
                 if size <= 4 * 1024 * 1024:
                     buf = fh.read()
                     meta_offset = struct.unpack('>I', buf[-4:])[0]
-                    if meta_offset >= size - 4:
-                        return None
-                    n_chunks = (meta_offset + CACHE2_CHUNK_SIZE - 1) // CACHE2_CHUNK_SIZE if meta_offset else 0
-                    meta_start = meta_offset + n_chunks * CACHE2_HASH_SIZE
-                    meta_block = buf[meta_start:-4]
+                    if meta_offset < size - 4:
+                        n_chunks = (meta_offset + CACHE2_CHUNK_SIZE - 1) // CACHE2_CHUNK_SIZE if meta_offset else 0
+                        meta_start = meta_offset + n_chunks * CACHE2_HASH_SIZE
+                        meta_block = buf[meta_start:-4]
+                    else:
+                        meta_block = b''
                 else:
+                    buf = None
                     fh.seek(-4, os.SEEK_END)
                     meta_offset = struct.unpack('>I', fh.read(4))[0]
                     if meta_offset >= size - 4:
@@ -1553,76 +1717,113 @@ class Firefox(WebBrowser):
         except (OSError, struct.error):
             return None
 
-        if len(meta_block) < 32:
+        # ---- Tier A: strict parse ----
+        if len(meta_block) >= 32:
+            hdr = meta_block[4:]
+            meta = cls._parse_cache2_meta_at(hdr)
+            if meta is not None:
+                fields, header_size = meta
+                key_size = fields['key_size']
+                key_bytes = hdr[header_size:header_size + key_size]
+                elements_blob = hdr[header_size + key_size + 1:]
+                elements = cls._parse_cache2_elements(elements_blob)
+                response_head = (elements.get('response-head')
+                                 or elements.get('original-response-headers') or '')
+                status_line, headers = cls._split_response_head(response_head)
+                m = _CACHE2_URL_RE.search(key_bytes)
+                url = m.group(1).decode('utf-8', errors='replace') if m else \
+                    key_bytes.decode('utf-8', errors='replace')
+                return {
+                    'data_size': meta_offset,
+                    'version': fields['version'],
+                    'fetch_count': fields['fetch_count'],
+                    'last_fetched': fields['last_fetched'],
+                    'last_modified': fields['last_modified'],
+                    'frecency': fields['frecency'],
+                    'expiration': fields['expiration'],
+                    'flags': fields['flags'],
+                    'key': key_bytes.decode('utf-8', errors='replace'),
+                    'url': url,
+                    'elements': elements,
+                    'status_line': status_line,
+                    'headers': headers,
+                    'recovery_state': 'live',
+                }
+
+        # ---- Tier B/C: recovery (only attempted on fully-read small files) ----
+        if buf is None:
             return None
 
-        hdr = meta_block[4:]  # drop leading u32 CRC
-        if len(hdr) < 28:
-            return None
-        try:
-            version, fetch_count, last_fetched, last_modified, frecency, expiration, key_size = \
-                struct.unpack('>IIIIIII', hdr[:28])
-        except struct.error:
+        back = cls._cache2_backscan_meta(buf)
+        if back is not None:
+            fields, key_bytes, elements_blob, _ms = back
+            elements = cls._parse_cache2_elements(elements_blob)
+            response_head = (elements.get('response-head')
+                             or elements.get('original-response-headers') or '')
+            status_line, headers = cls._split_response_head(response_head)
+            # Augment with regex-mined headers if the elements blob was wrecked.
+            if not headers:
+                regex = cls._cache2_regex_recover(buf)
+                headers = regex.get('headers', {})
+            m = _CACHE2_URL_RE.search(key_bytes)
+            url = m.group(1).decode('utf-8', errors='replace') if m else \
+                key_bytes.decode('utf-8', errors='replace')
+            return {
+                'data_size': 0,
+                'version': fields['version'],
+                'fetch_count': fields['fetch_count'],
+                'last_fetched': fields['last_fetched'],
+                'last_modified': fields['last_modified'],
+                'frecency': fields['frecency'],
+                'expiration': fields['expiration'],
+                'flags': fields['flags'],
+                'key': key_bytes.decode('utf-8', errors='replace'),
+                'url': url,
+                'elements': elements,
+                'status_line': status_line,
+                'headers': headers,
+                'recovery_state': 'recovered (relocated metadata)',
+            }
+
+        # ---- Tier D: regex-only recovery ----
+        regex = cls._cache2_regex_recover(buf)
+        url = regex.get('url')
+        headers = regex.get('headers', {})
+        timing = regex.get('timing', {})
+        if not url and not headers and not timing:
             return None
 
-        if version >= 2:
-            if len(hdr) < 32:
-                return None
-            flags = struct.unpack('>I', hdr[28:32])[0]
-            header_size = 32
+        part_host = regex.get('partition_host')
+        if url:
+            if headers:
+                rs = 'recovered (url + headers, no metadata)'
+            else:
+                rs = 'recovered (url only, no metadata)'
+        elif headers and timing:
+            rs = 'recovered (headers + telemetry, no url)'
+        elif headers:
+            rs = 'recovered (headers only)'
         else:
-            flags = None
-            header_size = 28
-
-        if key_size == 0 or key_size > 64 * 1024:
-            return None
-        if header_size + key_size + 1 > len(hdr):
-            return None
-
-        key_bytes = hdr[header_size:header_size + key_size]
-        elements_blob = hdr[header_size + key_size + 1:]
-
-        m = _CACHE2_URL_RE.search(key_bytes)
-        url = m.group(1).decode('utf-8', errors='replace') if m else \
-            key_bytes.decode('utf-8', errors='replace')
-
-        elements = {}
-        parts = elements_blob.split(b'\x00')
-        i = 0
-        while i + 1 < len(parts):
-            name = parts[i].decode('utf-8', errors='replace')
-            value = parts[i + 1].decode('utf-8', errors='replace')
-            if name:
-                elements[name] = value
-            i += 2
-
-        response_head = elements.get('response-head') or elements.get('original-response-headers') or ''
-        status_line = None
-        headers = {}
-        if response_head:
-            lines = response_head.replace('\r\n', '\n').split('\n')
-            status_line = lines[0].strip() if lines else None
-            for line in lines[1:]:
-                if ':' not in line:
-                    continue
-                name, _, value = line.partition(':')
-                if name.strip():
-                    headers[name.strip().lower()] = value.strip()
+            rs = 'recovered (telemetry only)'
 
         return {
-            'data_size': meta_offset,
-            'version': version,
-            'fetch_count': fetch_count,
-            'last_fetched': last_fetched,
-            'last_modified': last_modified,
-            'frecency': frecency,
-            'expiration': expiration if expiration else None,
-            'flags': flags,
-            'key': key_bytes.decode('utf-8', errors='replace'),
-            'url': url,
-            'elements': elements,
-            'status_line': status_line,
+            'data_size': 0,
+            'version': None,
+            'fetch_count': None,
+            'last_fetched': 0,
+            'last_modified': 0,
+            'frecency': None,
+            'expiration': None,
+            'flags': None,
+            'key': url or '',
+            'url': url or '',
+            'elements': {},
+            'status_line': (f'HTTP/1.1 {regex["status"]}'
+                            if 'status' in regex else None),
             'headers': headers,
+            'recovery_state': rs,
+            'partition_host': part_host,
+            'timing': timing,
         }
 
     def _resolve_cache_dir(self):
@@ -1686,6 +1887,7 @@ class Firefox(WebBrowser):
         source_item = os.path.relpath(cache_entries_dir, self.profile_path) \
             if cache_entries_dir.startswith(self.profile_path) else cache_entries_dir
         skipped = 0
+        recovery_counts = {}
         for name in names:
             path = os.path.join(cache_entries_dir, name)
             if not os.path.isfile(path):
@@ -1714,6 +1916,9 @@ class Firefox(WebBrowser):
             else:
                 data_summary = '<no data>'
 
+            recovery_state = parsed.get('recovery_state', 'live')
+            recovery_counts[recovery_state] = recovery_counts.get(recovery_state, 0) + 1
+
             item = Firefox.CacheItem(
                 profile=self.profile_path,
                 url=parsed['url'],
@@ -1724,19 +1929,49 @@ class Firefox(WebBrowser):
                 metadata=None,
                 data=None,
             )
-            item.row_type = 'cache'
+            if recovery_state == 'live':
+                item.row_type = 'cache'
+            else:
+                item.row_type = f'cache ({recovery_state})'
             item.data_summary = data_summary
             item.http_headers_str = str(parsed['headers']) if parsed['headers'] else ''
             item.etag = parsed['headers'].get('etag', '') or ''
             item.last_modified = parsed['headers'].get('last-modified', '') or ''
             item.source_item = source_item
+
+            # For regex-only recoveries, the partition host (top-frame site
+            # that triggered the request) and net-response telemetry are the
+            # primary forensic value. Surface them in the interpretation.
+            interp_bits = []
+            ph = parsed.get('partition_host')
+            if ph:
+                interp_bits.append(f'partitionKey host: {ph}')
+            timing = parsed.get('timing') or {}
+            if timing:
+                t_parts = [f'{k}={v}ms' for k, v in sorted(timing.items())]
+                interp_bits.append('net-response-time ' + ', '.join(t_parts))
+            if interp_bits:
+                item.interpretation = '; '.join(interp_bits)
+
             results.append(item)
 
         if skipped:
             log.info(f' - Skipped {skipped} unparseable files in cache directory')
 
+        if recovery_counts:
+            live_n = recovery_counts.pop('live', 0)
+            recovered_total = sum(recovery_counts.values())
+            log.info(f' - Parsed {len(results)} items '
+                     f'({live_n} live, {recovered_total} recovered)')
+            if recovered_total:
+                breakdown = ', '.join(
+                    f'{n} {state}' for state, n in
+                    sorted(recovery_counts.items(), key=lambda kv: -kv[1]))
+                log.info(f'   - Recovery breakdown: {breakdown}')
+        else:
+            log.info(f' - Parsed {len(results)} items')
+
         self.artifacts_counts['Cache'] = len(results)
-        log.info(f' - Parsed {len(results)} items')
         self.parsed_artifacts.extend(results)
 
     @staticmethod
