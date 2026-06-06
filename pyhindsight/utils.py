@@ -179,7 +179,7 @@ def decode_page_transition(raw):
     if isinstance(raw, str):
         return raw
 
-    # Source: http://src.chromium.org/svn/trunk/src/content/public/common/page_transition_types_list.h
+    # Source: https://source.chromium.org/chromium/chromium/src/+/main:ui/base/page_transition_types.h
     transition_friendly = {
         0: 'link',                 # User got to this page by clicking a link on another page.
         1: 'typed',                # User got this page by typing the URL in the URL bar.  This should not be
