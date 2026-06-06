@@ -330,7 +330,11 @@ class WebBrowser(object):
             self.sync_transaction_version = sync_transaction_version
 
     class BrowserExtension(object):
-        def __init__(self, profile, ext_id, name, description, version, permissions, manifest):
+        def __init__(self, profile, ext_id, name, description, version, permissions, manifest,
+                     on_disk=False, in_secure_prefs=False, install_time=None, update_time=None,
+                     location=None, state=None, from_webstore=None, was_installed_by_default=None,
+                     granted_scriptable_host=None, withholding_scriptable_host=None,
+                     runtime_granted_scriptable_host=None, content_scripts=None):
             self.profile = profile
             self.ext_id = ext_id
             self.name = name
@@ -338,6 +342,42 @@ class WebBrowser(object):
             self.version = version
             self.permissions = permissions
             self.manifest = manifest
+            # Presence: whether the extension was found unpacked on disk (Extensions/<id>/),
+            # registered in Secure Preferences (extensions.settings.<id>), or both.
+            self.on_disk = on_disk
+            self.in_secure_prefs = in_secure_prefs
+            # Fields sourced from Secure Preferences (extensions.settings.<id>)
+            self.install_time = install_time
+            self.update_time = update_time
+            self.location = location
+            self.state = state
+            self.from_webstore = from_webstore
+            self.was_installed_by_default = was_installed_by_default
+            # Host scope the extension can actually inject content scripts into
+            self.granted_scriptable_host = granted_scriptable_host or []
+            self.withholding_scriptable_host = withholding_scriptable_host or []
+            self.runtime_granted_scriptable_host = runtime_granted_scriptable_host or []
+            # List of declared content script blocks (from the manifest)
+            self.content_scripts = content_scripts or []
+            # Dynamically registered scripts from the 'Extension Scripts' StateStore
+            # (chrome.scripting.registerContentScripts / chrome.userScripts), normalized
+            # to the same shape as content_scripts with an added 'kind' tag.
+            self.dynamic_scripts = []
+            # Dynamic scripts carved from superseded / deleted LevelDB records that are no
+            # longer in the current live set (registered at some point, then removed). May
+            # be partial if recovered from a truncated record.
+            self.historical_dynamic_scripts = []
+
+        @property
+        def source(self):
+            """Human-readable presence indicator used in reporting."""
+            if self.on_disk and self.in_secure_prefs:
+                return 'Disk + Secure Prefs'
+            if self.in_secure_prefs:
+                return 'Secure Prefs only'
+            if self.on_disk:
+                return 'Disk only'
+            return 'Unknown'
 
     class LoginItem(HistoryItem):
         def __init__(self, profile, date_created, url, name, value, count, interpretation):

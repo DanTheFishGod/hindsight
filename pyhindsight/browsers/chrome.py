@@ -60,6 +60,10 @@ class Chrome(WebBrowser):
         self.cache_path = cache_path
         self.timezone = timezone
         self.installed_extensions = {}
+        # Per-extension records keyed by ext_id, merged from the on-disk Extensions/
+        # directory (get_extensions) and Secure Preferences (get_extension_settings).
+        # Merge is order-independent; installed_extensions['data'] is rebuilt from this.
+        self._extensions_by_id = {}
         self.cached_key = None
         self.available_decrypts = available_decrypts
         self.storage = storage
@@ -603,7 +607,7 @@ class Chrome(WebBrowser):
         """Decryption based on work by Nathan Henrie and Jordan Wright as well as Chromium source:
          - Mac/Linux: http://n8henrie.com/2014/05/decrypt-chrome-cookies-with-python/
          - Windows: https://gist.github.com/jordan-wright/5770442#file-chrome_extract-py
-         - Relevant Chromium source code: http://src.chromium.org/viewvc/chrome/trunk/src/components/os_crypt/
+         - Relevant Chromium source code: https://chromium.googlesource.com/chromium/src/+/main/components/os_crypt/
          """
         salt = b'saltysalt'
         iv = b' ' * 16
@@ -1785,7 +1789,6 @@ class Chrome(WebBrowser):
         return key
 
     def get_extensions(self, profile, dir_name):
-        results = []
         log.info('Extensions:')
 
         # Grab listing of 'Extensions' directory
@@ -1804,6 +1807,7 @@ class Chrome(WebBrowser):
         ext_listing = [str(x) for x in ext_listing if ext_id_re.match(x)]
         log.debug(f' - {len(ext_listing)} files in Extensions directory will be processed: {str(ext_listing)}')
 
+        disk_count = 0
         # Process each directory with an ext_id name
         for ext_id in ext_listing:
             manifest, extension_version = self.load_extension_manifest(extension_directory_path / ext_id)
@@ -1826,39 +1830,196 @@ class Chrome(WebBrowser):
 
             name = self.get_localized_messages(locale_messages, manifest.get('name', ''))
             description = self.get_localized_messages(locale_messages, manifest.get('description', ''))
-            results.append(Chrome.BrowserExtension(
-                profile=profile, ext_id=ext_id, name=name, description=description,
-                version=manifest.get('version'), permissions=str(manifest.get('permissions')),
-                manifest=json.dumps(manifest)))
 
+            # Merge into the shared per-extension record. On-disk data is authoritative
+            # for name/description/version/manifest, and its content_scripts come from the
+            # actual unpacked files (preferred over the Secure Preferences cached copy).
+            ext = self._extensions_by_id.get(ext_id)
+            if ext is None:
+                ext = Chrome.BrowserExtension(
+                    profile=profile, ext_id=ext_id, name=name, description=description,
+                    version=manifest.get('version'), permissions=str(manifest.get('permissions')),
+                    manifest=json.dumps(manifest))
+                self._extensions_by_id[ext_id] = ext
+            else:
+                ext.name = name or ext.name
+                ext.description = description or ext.description
+                ext.version = manifest.get('version') or ext.version
+                ext.permissions = str(manifest.get('permissions'))
+                ext.manifest = json.dumps(manifest)
+            ext.on_disk = True
+            ext.profile = profile
+            if manifest.get('content_scripts'):
+                ext.content_scripts = manifest['content_scripts']
+            disk_count += 1
 
-        self.artifacts_counts['Extensions'] = len(results)
-        log.info(f' - Parsed {len(results)} items')
-        presentation = {'title': 'Installed Extensions',
-                        'columns': [
-                            {'display_name': 'Extension Name',
-                             'data_name': 'name',
-                             'display_width': 26},
-                            {'display_name': 'Description',
-                             'data_name': 'description',
-                             'display_width': 60},
-                            {'display_name': 'Version',
-                             'data_name': 'version',
-                             'display_width': 10},
-                            {'display_name': 'App ID',
-                             'data_name': 'ext_id',
-                             'display_width': 36},
-                            {'display_name': 'Profile Folder',
-                             'data_name': 'profile',
-                             'display_width': 30},
-                            {'display_name': 'Permissions',
-                             'data_name': 'permissions',
-                             'display_width': 45},
-                            {'display_name': 'Manifest',
-                             'data_name': 'manifest',
-                             'display_width': 60}
-                        ]}
-        self.installed_extensions = {'data': results, 'presentation': presentation}
+        self.artifacts_counts['Extensions'] = disk_count
+        log.info(f' - Parsed {disk_count} items')
+        self._rebuild_installed_extensions()
+
+    def _rebuild_installed_extensions(self):
+        """Rebuild installed_extensions['data'] from the merged per-extension records.
+
+        No 'presentation' key is set: the merged extension data is rendered by the
+        dedicated nested 'Extensions' worksheet in analysis.generate_excel rather than
+        the generic flat-table presentation path.
+        """
+        data = sorted(self._extensions_by_id.values(),
+                      key=lambda e: (e.name or e.ext_id or '').lower())
+        self.installed_extensions = {'data': data}
+
+    def get_extension_settings(self, path, preferences_file):
+        """Parse extensions.settings from the Secure Preferences file.
+
+        Records are merged by ext_id into the same per-extension structure
+        populated from the on-disk Extensions/ directory by get_extensions(), and the
+        install/update times are emitted as timestamped Timeline rows.
+        """
+        # mojom ManifestLocation -> human-readable
+        # From https://source.chromium.org/chromium/chromium/src/+/main:extensions/common/mojom/manifest.mojom
+        EXTENSION_LOCATIONS = {
+            0: 'Invalid',
+            1: 'Internal (Web Store)',
+            2: 'External (pref)',
+            3: 'External (registry)',
+            4: 'Unpacked (developer mode)',
+            5: 'Component',
+            6: 'External pref download',
+            7: 'External policy download',
+            8: 'Command line',
+            9: 'External policy',
+            10: 'External component',
+        }
+        # Legacy 'state' pref values (historical Extension::State). This key is now obsolete
+        # in current Chrome (it appears in ExtensionPrefs' obsolete-keys list; disabled
+        # status is tracked via disable_reasons), but older profiles still write it, so we
+        # still decode it when present. Pref handling / obsolescence:
+        # From https://source.chromium.org/chromium/chromium/src/+/main:extensions/browser/extension_prefs.cc
+        EXTENSION_STATES = {
+            0: 'Disabled',
+            1: 'Enabled',
+            2: 'External extension uninstalled',
+        }
+
+        log.info('Extension Settings (Secure Preferences):')
+        pref_path = os.path.join(path, preferences_file)
+        source_item = os.path.relpath(pref_path, self.profile_path)
+        try:
+            log.info(f' - Reading from {pref_path}')
+            with open(pref_path, encoding='utf-8', errors='replace') as f:
+                prefs = json.loads(f.read())
+        except Exception as e:
+            log.exception(f' - Error decoding {preferences_file} file {pref_path}: {e}')
+            self.artifacts_counts[preferences_file] = 'Failed'
+            return
+
+        settings = prefs.get('extensions', {}).get('settings', {})
+        if not settings:
+            log.info(' - No extensions.settings found')
+            self.artifacts_counts[preferences_file] = 0
+            return
+
+        profile_folder = os.path.split(path)[1]
+        timestamped_items = []
+        count = 0
+
+        # Per-extension pref keys (manifest, granted_permissions, withholding_permissions,
+        # runtime_granted_permissions, first_install_time, last_update_time, from_webstore,
+        # was_installed_by_default, location, state) are defined/written by ExtensionPrefs.
+        # From https://source.chromium.org/chromium/chromium/src/+/main:extensions/browser/extension_prefs.cc
+        for ext_id, v in settings.items():
+            if not isinstance(v, dict):
+                continue
+
+            manifest = v.get('manifest') if isinstance(v.get('manifest'), dict) else {}
+
+            # Granted/withheld host scope determines where content scripts can inject.
+            def _scriptable(perm_key):
+                perms = v.get(perm_key)
+                if isinstance(perms, dict):
+                    return perms.get('scriptable_host') or []
+                return []
+
+            granted_scriptable = _scriptable('granted_permissions')
+            withholding_scriptable = _scriptable('withholding_permissions')
+            runtime_scriptable = _scriptable('runtime_granted_permissions')
+
+            content_scripts = manifest.get('content_scripts') or []
+
+            location = v.get('location')
+            location_str = EXTENSION_LOCATIONS.get(location, location)
+            state = v.get('state')
+            state_str = EXTENSION_STATES.get(state, state)
+
+            # Prefer first_install_time; fall back to legacy install_time.
+            raw_install = v.get('first_install_time') or v.get('install_time')
+            raw_update = v.get('last_update_time')
+            install_dt = utils.to_datetime(raw_install, self.timezone, quiet=True) if raw_install else None
+            update_dt = utils.to_datetime(raw_update, self.timezone, quiet=True) if raw_update else None
+
+            name = manifest.get('name')
+
+            # Merge into the shared per-extension record (order-independent with get_extensions).
+            ext = self._extensions_by_id.get(ext_id)
+            if ext is None:
+                ext = Chrome.BrowserExtension(
+                    profile=profile_folder, ext_id=ext_id, name=name,
+                    description=manifest.get('description'), version=manifest.get('version'),
+                    permissions=str(manifest.get('permissions')), manifest=json.dumps(manifest))
+                self._extensions_by_id[ext_id] = ext
+            else:
+                # Disk data is authoritative for name/description/version/manifest; only
+                # fill from Secure Preferences when the on-disk copy didn't provide them.
+                if not ext.name:
+                    ext.name = name
+                if not ext.description:
+                    ext.description = manifest.get('description')
+                if not ext.version:
+                    ext.version = manifest.get('version')
+                if not ext.manifest:
+                    ext.manifest = json.dumps(manifest)
+
+            ext.in_secure_prefs = True
+            ext.install_time = install_dt
+            ext.update_time = update_dt
+            ext.location = location_str
+            ext.state = state_str
+            ext.from_webstore = v.get('from_webstore')
+            ext.was_installed_by_default = v.get('was_installed_by_default')
+            ext.granted_scriptable_host = granted_scriptable
+            ext.withholding_scriptable_host = withholding_scriptable
+            ext.runtime_granted_scriptable_host = runtime_scriptable
+            # On-disk content scripts (actual files) win; otherwise use the cached copy here.
+            if not ext.content_scripts and content_scripts:
+                ext.content_scripts = content_scripts
+
+            # Emit Timeline rows for install / update events. When the update time equals
+            # the install time, emit only the install row.
+            display_name = ext.name or ext_id
+            host_scope = ', '.join(granted_scriptable) if granted_scriptable else 'none'
+            value_str = f'Install source: {location_str} | Granted host scope: {host_scope}'
+            timeline_events = [('installed', install_dt, raw_install)]
+            if update_dt is not None and update_dt != install_dt:
+                timeline_events.append(('updated', update_dt, raw_update))
+            for label, dt, raw in timeline_events:
+                if dt is None:
+                    continue
+                pref_item = Chrome.PreferenceItem(
+                    self.profile_path, url=ext_id, timestamp=dt,
+                    key=f'{display_name} [{ext_id}]',
+                    value=value_str,
+                    interpretation='')
+                pref_item.row_type = f'extension ({label})'
+                pref_item.source_item = source_item
+                timestamped_items.append(pref_item)
+
+            count += 1
+
+        self.parsed_artifacts.extend(timestamped_items)
+        self._rebuild_installed_extensions()
+        self.artifacts_counts[preferences_file] = count
+        log.info(f' - Parsed {count} extension settings entries '
+                 f'({len(timestamped_items)} Timeline events)')
 
     def get_preferences(self, path, preferences_file):
         def check_and_append_pref(parent, pref, value=None, description=None):
@@ -2113,11 +2274,15 @@ class Chrome(WebBrowser):
 
         # Network Prediction
         if prefs.get('net'):
-            # Ref: https://source.chromium.org/chromium/chromium/src/+/main:chrome/browser/net/prediction_options.h
+            # NetworkPredictionOptions. The enum was reassigned when network prediction was
+            # merged into the preloading setting; older profiles used 0=Always, 1=WifiOnly,
+            # 2=Never. Current values:
+            # Ref: https://source.chromium.org/chromium/chromium/src/+/main:chrome/browser/preloading/preloading_prefs.h
             NETWORK_PREDICTION_OPTIONS = {
-                0: 'Always',
-                1: 'WIFI Only',
-                2: 'Never'
+                0: 'Standard preloading',
+                1: 'WiFi only (deprecated; = default)',
+                2: 'No preloading',
+                3: 'Extended preloading',
             }
             append_group('Network Prefetching')
             check_and_append_pref(prefs['net'], 'network_prediction_options',
@@ -3241,6 +3406,15 @@ class Chrome(WebBrowser):
             log.warning(f' - Error reading records ({e}); possible LevelDB corruption')
             self.artifacts_counts[f'{dir_name}'] = 'Failed'
 
+        # For the 'Extension Scripts' StateStore, capture the latest (highest-seq,
+        # non-deleted) 'dynamic_scripts' value per extension for the live merge, and ALSO
+        # every physical record version (older seqs + deletion tombstones) so superseded /
+        # removed dynamic scripts can be recovered. The '<ext_id>.dynamic_scripts'
+        # StateStore key is scripting::kRegisteredScriptsStorageKey ("dynamic_scripts").
+        # From https://source.chromium.org/chromium/chromium/src/+/main:extensions/browser/scripting_constants.h
+        dynamic_scripts_raw = {}    # ext_id -> (seq, json_value)  -- current/live
+        dynamic_scripts_all = []    # [(ext_id, seq, state, value)] -- every recoverable record
+
         if ldb_records:
             for record in ldb_records.iterate_records_raw():
                 user_key = record.user_key.decode()
@@ -3262,11 +3436,192 @@ class Chrome(WebBrowser):
 
                 results.append(parsed)
 
+                if dir_name == 'Extension Scripts' and ext_id and user_key == 'dynamic_scripts':
+                    dynamic_scripts_all.append((ext_id, record.seq, record.state.name, parsed.value))
+                    if record.state.name != 'Deleted':
+                        prior = dynamic_scripts_raw.get(ext_id)
+                        if prior is None or record.seq > prior[0]:
+                            dynamic_scripts_raw[ext_id] = (record.seq, parsed.value)
+
             ldb_records.close()
             self.artifacts_counts[f'{dir_name}'] = len(results)
 
+        if dynamic_scripts_raw:
+            self._merge_dynamic_scripts(dynamic_scripts_raw)
+        if dynamic_scripts_all:
+            self._carve_dynamic_scripts(dynamic_scripts_all)
+
         log.info(f' - Parsed {len(results)} {dir_name} items')
         self.parsed_extension_data.extend(results)
+
+    @staticmethod
+    def _normalize_dynamic_script(entry):
+        """Normalize a dynamically-registered script (Extension Scripts StateStore) to the
+        same shape as a manifest content_scripts block. Dynamic scripts use camelCase keys
+        and list their files as {'file': ...} / {'code': ...} objects, unlike the manifest.
+
+        Field schema (id, matches, excludeMatches, js, css, runAt, allFrames, world,
+        matchOriginAsFallback) from the chrome.scripting / chrome.userScripts API:
+        From https://source.chromium.org/chromium/chromium/src/+/main:extensions/common/api/scripting.idl
+        The 'source' value (USER_SCRIPT / DYNAMIC_CONTENT_SCRIPT) is the serialized
+        UserScript::Source:
+        From https://source.chromium.org/chromium/chromium/src/+/main:extensions/common/user_script.h
+        """
+        def file_list(items):
+            out = []
+            for it in items or []:
+                if isinstance(it, dict):
+                    out.append(it.get('file') or ('(inline code)' if 'code' in it else ''))
+                else:
+                    out.append(it)
+            return [x for x in out if x]
+
+        return {
+            'id': entry.get('id'),
+            'matches': entry.get('matches', []) or [],
+            'exclude_matches': entry.get('excludeMatches') or entry.get('exclude_matches') or [],
+            'run_at': entry.get('runAt') or entry.get('run_at'),
+            'all_frames': entry.get('allFrames', entry.get('all_frames')),
+            'world': entry.get('world'),
+            'js': file_list(entry.get('js')),
+            'css': file_list(entry.get('css')),
+            # 'USER_SCRIPT' for chrome.userScripts, else a dynamic content script.
+            'kind': entry.get('source') or 'DYNAMIC_CONTENT_SCRIPT',
+        }
+
+    @staticmethod
+    def _extract_json_objects(text):
+        """Best-effort recovery of top-level {...} objects from a (possibly truncated)
+        JSON value, ignoring braces inside strings. Used to salvage individual scripts
+        from partial LevelDB records the json parser can't load whole."""
+        objects = []
+        depth = 0
+        start = None
+        in_string = False
+        escape = False
+        for i, ch in enumerate(text):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == '}':
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start is not None:
+                        objects.append(text[start:i + 1])
+                        start = None
+        return objects
+
+    @staticmethod
+    def _parse_dynamic_scripts_value(value):
+        """Parse a dynamic_scripts record value into a list of script entries.
+        Returns (entries, partial) where partial=True when the value could not be parsed
+        as whole JSON and individual objects were salvaged instead."""
+        try:
+            data = json.loads(value)
+            if isinstance(data, list):
+                return data, False
+            if isinstance(data, dict):
+                return [data], False
+            return [], False
+        except (ValueError, TypeError):
+            entries = []
+            for frag in Chrome._extract_json_objects(value or ''):
+                try:
+                    entries.append(json.loads(frag))
+                except (ValueError, TypeError):
+                    continue
+            return entries, True
+
+    @staticmethod
+    def _dynamic_script_sig(s):
+        """Signature for de-duplicating recovered scripts against the live set and each
+        other (independent of key ordering / list ordering)."""
+        return (
+            s.get('kind'), s.get('id'), s.get('run_at'), bool(s.get('all_frames')),
+            s.get('world'),
+            tuple(sorted(s.get('matches') or [])),
+            tuple(sorted(s.get('exclude_matches') or [])),
+            tuple(sorted(s.get('js') or [])),
+            tuple(sorted(s.get('css') or [])),
+        )
+
+    def _get_or_create_extension(self, ext_id):
+        ext = self._extensions_by_id.get(ext_id)
+        if ext is None:
+            ext = Chrome.BrowserExtension(
+                profile=os.path.split(self.profile_path)[1], ext_id=ext_id, name=None,
+                description=None, version=None, permissions=None, manifest=None)
+            self._extensions_by_id[ext_id] = ext
+        return ext
+
+    def _merge_dynamic_scripts(self, dynamic_scripts_raw):
+        merged = 0
+        for ext_id, (_seq, value) in dynamic_scripts_raw.items():
+            entries, partial = self._parse_dynamic_scripts_value(value)
+            if not entries:
+                continue
+            ext = self._get_or_create_extension(ext_id)
+            scripts = []
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                s = self._normalize_dynamic_script(e)
+                if partial:
+                    s['partial'] = True
+                scripts.append(s)
+            ext.dynamic_scripts = scripts
+            merged += len(scripts)
+        if merged:
+            self._rebuild_installed_extensions()
+            log.info(f' - Merged {merged} dynamically-registered script(s) into extension records')
+
+    def _carve_dynamic_scripts(self, records):
+        """Recover dynamic scripts from every physical 'dynamic_scripts' record (older
+        sequence numbers and deletion tombstones), keeping those not present in the current
+        live set -- i.e. scripts that were registered at some point and later removed."""
+        # Signatures already represented in the live set, per extension.
+        live_sigs = {}
+        for ext_id, ext in self._extensions_by_id.items():
+            live_sigs[ext_id] = {self._dynamic_script_sig(s)
+                                 for s in (getattr(ext, 'dynamic_scripts', None) or [])}
+
+        recovered = {}  # ext_id -> {sig: script}
+        for ext_id, _seq, state, value in records:
+            entries, partial = self._parse_dynamic_scripts_value(value)
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                s = self._normalize_dynamic_script(e)
+                sig = self._dynamic_script_sig(s)
+                if sig in live_sigs.get(ext_id, set()):
+                    continue  # still registered; shown as a live row already
+                slot = recovered.setdefault(ext_id, {})
+                if sig not in slot:
+                    s['partial'] = partial
+                    s['recovered_state'] = state
+                    slot[sig] = s
+
+        count = 0
+        for ext_id, slot in recovered.items():
+            if not slot:
+                continue
+            ext = self._get_or_create_extension(ext_id)
+            ext.historical_dynamic_scripts = list(slot.values())
+            count += len(slot)
+        if count:
+            self._rebuild_installed_extensions()
+            log.info(f' - Recovered {count} historical/removed dynamic script(s) from superseded records')
 
     def get_partitioned_extension_data(self, path, dir_name):
         results = []
@@ -4269,6 +4624,12 @@ class Chrome(WebBrowser):
                     self.profile_path, 'Extensions',
                     display_key='Extensions', display_value='Installed Extensions')
 
+            if 'Secure Preferences' in input_listing:
+                run_with_status(
+                    'Extension Settings', 'Secure Preferences', self.get_extension_settings,
+                    self.profile_path, 'Secure Preferences',
+                    display_key='Extension Settings', display_value='Extension settings entries')
+
             if 'Extension Cookies' in input_listing:
                 # Workaround to cap the version at 65 for Extension Cookies, as until that
                 # point it has the same database format as Cookies
@@ -4387,7 +4748,7 @@ class Chrome(WebBrowser):
             self.transition_friendly = utils.decode_page_transition(self.transition)
 
         def decode_source(self):
-            # https://source.chromium.org/chromium/chromium/src/+/master:components/history/core/browser/history_types.h
+            # https://source.chromium.org/chromium/chromium/src/+/main:components/history/core/browser/history_types.h
             source_friendly = {
                 0:    'Synced',               # Synchronized from somewhere else.
                 1:    'Local',                # User browsed. In my experience, this value isn't written; it will be

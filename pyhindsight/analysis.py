@@ -725,6 +725,16 @@ class AnalysisSession(object):
                         **browser_analysis.session_structure
                     })
 
+                # installed_extensions no longer carries a 'presentation' (it is rendered by
+                # the dedicated nested Extensions worksheet), so promote it explicitly here
+                # rather than via promote_object_to_analysis_session().
+                browser_extensions = getattr(browser_analysis, 'installed_extensions', None)
+                if browser_extensions and browser_extensions.get('data'):
+                    if not getattr(self, 'installed_extensions', None):
+                        self.installed_extensions = {'data': []}
+                    self.installed_extensions.setdefault('data', [])
+                    self.installed_extensions['data'].extend(browser_extensions['data'])
+
                 for item in browser_analysis.__dict__:
                     if isinstance(browser_analysis.__dict__[item], dict):
                         try:
@@ -1322,6 +1332,16 @@ class AnalysisSession(object):
                     w.write(row_number, 6, item.profile, gray_value_format)  # Profile
                     w.write(row_number, 7, item.source_item or '', gray_value_format)  # Source Item
 
+                elif item.row_type.startswith("extension"):
+                    w.write_string(row_number, 0, item.row_type, blue_type_format)  # record_type
+                    w.write(row_number, 1, friendly_date(item.timestamp), blue_date_format)  # date
+                    w.write_string(row_number, 2, item.url, blue_url_format)  # URL (ext_id)
+                    w.write_string(row_number, 3, item.name, blue_field_format)  # extension name [id]
+                    w.write_string(row_number, 4, item.value, blue_value_format)  # installed/updated
+                    w.write(row_number, 5, item.interpretation, blue_value_format)  # location + host scope
+                    w.write(row_number, 6, item.profile, blue_value_format)  # Profile
+                    w.write(row_number, 7, item.source_item or '', blue_value_format)  # Source Item
+
                 if friendly_date(item.timestamp) < '1970-01-02':
                     w.set_row(row_number, options={'hidden': True})
 
@@ -1808,10 +1828,28 @@ class AnalysisSession(object):
                           black_value_format, black_date_format, black_url_format)
                 sw_row += 1
 
+        # Map ext_id -> name so chrome-extension:// origins can be annotated like elsewhere.
+        ext_name_by_id = {}
+        _inst = getattr(self, 'installed_extensions', None)
+        if _inst and _inst.get('data'):
+            for _e in _inst['data']:
+                _eid, _nm = getattr(_e, 'ext_id', None), getattr(_e, 'name', None)
+                if _eid and _nm:
+                    ext_name_by_id[_eid] = _nm
+
+        def annotate_origin(origin):
+            prefix = 'chrome-extension://'
+            if origin and origin.startswith(prefix):
+                ext_id = origin[len(prefix):].split('/', 1)[0]
+                name = ext_name_by_id.get(ext_id)
+                if name:
+                    return f'{origin} ({name})'
+            return origin
+
         for origin in sorted(origins.keys()):
             data = origins[origin]
             # Origin merged bar
-            sw.merge_range(sw_row, 0, sw_row, last_col, origin, sw_origin_header_fmt)
+            sw.merge_range(sw_row, 0, sw_row, last_col, annotate_origin(origin), sw_origin_header_fmt)
             sw_row += 1
 
             # Sort registration groups: by reg_id asc, then version_id desc
@@ -1909,6 +1947,7 @@ class AnalysisSession(object):
                 sw_row += 1
 
         sw.freeze_panes(2, 0)
+        sw.autofilter(1, 0, sw_row, last_col)  # Add autofilter
 
         #########################################
         # Extension Data worksheet
@@ -2247,9 +2286,204 @@ class AnalysisSession(object):
 
                 # Formatting
                 sess_ws.freeze_panes(2, 0)
+                sess_ws.autofilter(1, 0, row_number, 8)  # Add autofilter
 
             except Exception as e:
                 log.warning(f"Exception occurred while writing Sessions page: {e}")
+
+        #########################################
+        # Extensions worksheet (nested)
+        #########################################
+        installed_extensions = getattr(self, 'installed_extensions', None)
+        if installed_extensions and installed_extensions.get('data'):
+            try:
+                ext_ws = workbook.add_worksheet(get_unique_sheet_name('Extensions'))
+
+                # Title bar
+                ext_ws.merge_range('A1:H1', f'Hindsight Internet History Forensics (v{__version__})'
+                                   ' - Extensions', title_header_format)
+
+                # Column headers
+                ext_ws.write(1, 0, 'Extension', header_format)
+                ext_ws.write(1, 1, 'Type', header_format)
+                ext_ws.write(1, 2, 'Matches / Host', header_format)
+                ext_ws.write(1, 3, 'run_at', header_format)
+                ext_ws.write(1, 4, 'all_frames', header_format)
+                ext_ws.write(1, 5, 'world', header_format)
+                ext_ws.write(1, 6, 'JS / CSS', header_format)
+                ext_ws.write(1, 7, 'Profile', header_format)
+
+                # Column widths
+                ext_ws.set_column('A:A', 22)  # Extension (merged headers; data column is empty)
+                ext_ws.set_column('B:B', 16)  # Type
+                ext_ws.set_column('C:C', 55)  # Matches / Host
+                ext_ws.set_column('D:D', 16)  # run_at
+                ext_ws.set_column('E:E', 10)  # all_frames
+                ext_ws.set_column('F:F', 10)  # world
+                ext_ws.set_column('G:G', 50)  # JS / CSS
+                ext_ws.set_column('H:H', 30)  # Profile
+
+                ext_header_format = workbook.add_format({
+                    'font_color': 'white', 'bg_color': '#595959', 'bold': True})
+                cs_format = workbook.add_format({'font_color': 'black', 'align': 'left'})
+                cs_center_format = workbook.add_format({'font_color': 'black', 'align': 'center'})
+                # Dynamically-registered scripts get a distinct color to set them apart from
+                # the statically-declared manifest content scripts.
+                dyn_format = workbook.add_format({'font_color': '#7030A0', 'align': 'left'})
+                dyn_center_format = workbook.add_format({'font_color': '#7030A0', 'align': 'center'})
+                # Recovered (superseded / deleted) dynamic scripts: red + italic.
+                rec_format = workbook.add_format({'font_color': '#C00000', 'italic': True, 'align': 'left'})
+                rec_center_format = workbook.add_format({'font_color': '#C00000', 'italic': True, 'align': 'center'})
+                host_format = workbook.add_format({'font_color': '#1F6FB2', 'align': 'left'})
+                none_format = workbook.add_format({'font_color': 'gray', 'italic': True})
+
+                def fmt_date(ts):
+                    return friendly_date(ts) if ts else ''
+
+                def fmt_patterns(patterns, cap=12):
+                    """Join match patterns; cap very long lists (dynamic adblock scripts can
+                    have hundreds) so cells stay readable while noting the true total."""
+                    patterns = patterns or []
+                    if len(patterns) > cap:
+                        return ', '.join(patterns[:cap]) + f'  (+{len(patterns) - cap} more, {len(patterns)} total)'
+                    return ', '.join(patterns)
+
+                row_number = 2
+
+                def write_script_row(label, cs, fmt, center_fmt):
+                    nonlocal row_number
+                    matches = fmt_patterns(cs.get('matches'))
+                    excludes = cs.get('exclude_matches') or []
+                    if excludes:
+                        matches += f'  (excludes: {fmt_patterns(excludes)})'
+                    js = cs.get('js') or []
+                    css = cs.get('css') or []
+                    js_css = ', '.join(js)
+                    if css:
+                        js_css = (js_css + ' | ' if js_css else '') + 'css: ' + ', '.join(css)
+                    all_frames = cs.get('all_frames')
+                    all_frames_str = '' if all_frames is None else ('true' if all_frames else 'false')
+                    # Surface the dynamic script id in the JS column for traceability.
+                    if cs.get('id') and label != 'content script':
+                        js_css = f'[{cs["id"]}] {js_css}' if js_css else f'[{cs["id"]}]'
+
+                    ext_ws.write(row_number, 0, '', fmt)
+                    ext_ws.write_string(row_number, 1, label, fmt)
+                    ext_ws.write_string(row_number, 2, matches, fmt)
+                    ext_ws.write_string(row_number, 3, cs.get('run_at', '') or '', fmt)
+                    ext_ws.write_string(row_number, 4, all_frames_str, center_fmt)
+                    ext_ws.write_string(row_number, 5, cs.get('world', '') or '', center_fmt)
+                    ext_ws.write_string(row_number, 6, js_css, fmt)
+                    ext_ws.write_string(row_number, 7, profile, fmt)
+                    row_number += 1
+
+                for ext in installed_extensions['data']:
+                    # Parent (extension) header row, full width
+                    name = getattr(ext, 'name', None) or getattr(ext, 'ext_id', '')
+                    ext_id = getattr(ext, 'ext_id', '')
+                    parts = [f'{name} ({ext_id})']
+                    if getattr(ext, 'state', None):
+                        parts.append(f'State: {ext.state}')
+                    # 'source' = which artifacts the extension was found in (presence),
+                    # distinct from 'location' = how/where Chrome installed it.
+                    parts.append(f'Found in: {getattr(ext, "source", "Unknown")}')
+                    if getattr(ext, 'location', None):
+                        parts.append(f'Install source: {ext.location}')
+                    if getattr(ext, 'from_webstore', None):
+                        parts.append('From Web Store')
+                    if getattr(ext, 'was_installed_by_default', None):
+                        parts.append('Default-installed')
+                    if getattr(ext, 'install_time', None):
+                        parts.append(f'Installed: {fmt_date(ext.install_time)}')
+                    if getattr(ext, 'update_time', None):
+                        parts.append(f'Updated: {fmt_date(ext.update_time)}')
+                    ext_ws.merge_range(row_number, 0, row_number, 7, ' | '.join(parts), ext_header_format)
+                    row_number += 1
+
+                    profile = getattr(ext, 'profile', '') or ''
+                    wrote_child = False
+
+                    # 1) Current capability: manifest content scripts, then live dynamically
+                    #    registered scripts (chrome.scripting / chrome.userScripts).
+                    for cs in (getattr(ext, 'content_scripts', None) or []):
+                        if isinstance(cs, dict):
+                            write_script_row('content script', cs, cs_format, cs_center_format)
+                            wrote_child = True
+                    for cs in (getattr(ext, 'dynamic_scripts', None) or []):
+                        if not isinstance(cs, dict):
+                            continue
+                        label = 'user script' if cs.get('kind') == 'USER_SCRIPT' else 'dynamic content script'
+                        write_script_row(label, cs, dyn_format, dyn_center_format)
+                        wrote_child = True
+
+                    # 2) Current host scope (where the extension can actually inject).
+                    for label, hosts in (('host (granted)', getattr(ext, 'granted_scriptable_host', None)),
+                                         ('host (withheld)', getattr(ext, 'withholding_scriptable_host', None)),
+                                         ('host (runtime grant)', getattr(ext, 'runtime_granted_scriptable_host', None))):
+                        if not hosts:
+                            continue
+                        ext_ws.write(row_number, 0, '', host_format)
+                        ext_ws.write_string(row_number, 1, label, host_format)
+                        ext_ws.write_string(row_number, 2, ', '.join(hosts), host_format)
+                        ext_ws.write_string(row_number, 7, profile, host_format)
+                        row_number += 1
+                        wrote_child = True
+
+                    # 3) Historical: dynamic scripts recovered from superseded / deleted
+                    #    records, no longer live -- shown last so each block reads
+                    #    "current, then historical".
+                    for cs in (getattr(ext, 'historical_dynamic_scripts', None) or []):
+                        if not isinstance(cs, dict):
+                            continue
+                        base = 'user script' if cs.get('kind') == 'USER_SCRIPT' else 'dynamic content script'
+                        tag = 'recovered, deleted' if cs.get('recovered_state') == 'Deleted' else 'recovered'
+                        if cs.get('partial'):
+                            tag += ', partial'
+                        write_script_row(f'{base} ({tag})', cs, rec_format, rec_center_format)
+                        wrote_child = True
+
+                    if not wrote_child:
+                        ext_ws.write(row_number, 0, '', none_format)
+                        ext_ws.write_string(row_number, 1, '(no declarative content scripts)', none_format)
+                        ext_ws.write_string(row_number, 7, profile, none_format)
+                        row_number += 1
+
+                    row_number += 1  # blank row between extensions
+
+                # Formatting
+                ext_ws.freeze_panes(2, 0)
+                ext_ws.autofilter(1, 0, row_number, 7)  # Add autofilter
+
+            except Exception as e:
+                log.warning(f"Exception occurred while writing Extensions page: {e}")
+
+        # Reorder worksheet tabs. Sheets are built in a different order than we want them
+        # presented, so sort the worksheet list by a desired-order key just before writing.
+        # Stable sort preserves insertion order within a group (e.g. multiple per-profile
+        # Preferences/Sessions sheets) and sends any unlisted sheet to the end.
+        def _tab_order(ws):
+            name = ws.name
+            if name == 'Timeline':
+                return 0
+            if name.startswith('Sessions'):
+                return 1
+            if name == 'Storage':
+                return 2
+            if name.startswith('Preferences'):
+                return 3
+            if name == 'Sync Data':
+                return 4
+            if name.startswith('Extensions'):
+                return 5
+            if name == 'Extension Data':
+                return 6
+            if name == 'Service Workers':
+                return 7
+            return 8
+        try:
+            workbook.worksheets_objs.sort(key=_tab_order)
+        except Exception as e:
+            log.warning(f"Could not reorder worksheet tabs: {e}")
 
         workbook.close()
 
