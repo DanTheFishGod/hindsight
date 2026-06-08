@@ -532,30 +532,97 @@ class Chrome(WebBrowser):
         log.info(f' - Parsed {len(results)} items')
         self.parsed_artifacts.extend(results)
 
+    @staticmethod
+    def _download_interpretation(item):
+        """Build the Timeline Interpretation summary for a download from its richer fields
+        (shared by the History and shared_proto_db download parsers)."""
+        parts = []
+        if getattr(item, 'download_source', None):
+            parts.append(f'Source: {item.download_source}')
+        by_ext = getattr(item, 'by_ext_name', None) or getattr(item, 'by_ext_id', None)
+        if by_ext:
+            parts.append(f'By extension: {by_ext}')
+        if getattr(item, 'by_web_app_id', None):
+            parts.append(f'By web app: {item.by_web_app_id}')
+        # mime_type / referrer / tab_url have dedicated Timeline columns, so they are not
+        # repeated here.
+        if getattr(item, 'site_url', None):
+            parts.append(f'Site: {item.site_url}')
+        if getattr(item, 'http_method', None):
+            parts.append(f'Method: {item.http_method}')
+        if getattr(item, 'storage_partition', None):
+            parts.append(f'Storage partition: {item.storage_partition}')
+        if getattr(item, 'fetched_via_service_worker', None):
+            parts.append('Via service worker')
+        chain = getattr(item, 'url_chain', None)
+        if chain and len(chain) > 1:
+            parts.append('Redirect chain: ' + ' -> '.join(chain))
+        if getattr(item, 'request_headers', None):
+            parts.append(f'{len(item.request_headers)} request header(s)')
+        if getattr(item, 'transient', None):
+            parts.append('Transient')
+        return ' | '.join(parts)
+
     def get_downloads(self, path, database, version, row_type):
         # Set up empty return array
         results = []
 
         log.info(f'Download items from {database}:')
 
-        # Queries for different versions
-        query = {30: '''SELECT downloads.id, downloads_url_chains.url, downloads.received_bytes, downloads.total_bytes,
-                            downloads.state, downloads.target_path, downloads.start_time, downloads.end_time,
-                            downloads.opened, downloads.danger_type, downloads.interrupt_reason, downloads.etag,
-                            downloads.last_modified, downloads_url_chains.chain_index
-                        FROM downloads, downloads_url_chains WHERE downloads_url_chains.id = downloads.id''',
-                 26: '''SELECT downloads.id, downloads_url_chains.url, downloads.received_bytes, downloads.total_bytes,
-                            downloads.state, downloads.target_path, downloads.start_time, downloads.end_time,
-                            downloads.opened, downloads.danger_type, downloads.interrupt_reason,
-                            downloads_url_chains.chain_index
-                        FROM downloads, downloads_url_chains WHERE downloads_url_chains.id = downloads.id''',
-                 16: '''SELECT downloads.id, downloads.url, downloads.received_bytes, downloads.total_bytes,
-                            downloads.state, downloads.full_path, downloads.start_time, downloads.end_time,
-                            downloads.opened
-                        FROM downloads''',
-                 1:  '''SELECT downloads.id, downloads.url, downloads.received_bytes, downloads.total_bytes,
-                            downloads.state, downloads.full_path, downloads.start_time
-                        FROM downloads'''}
+        # Queries for different versions. Columns are cumulative; the version key is the
+        # Chrome version a column first appears (per the downloads field-availability chart).
+        # embedder_download_data (v100) is intentionally omitted (opaque
+        # StoragePartitionConfig -- see documentation/future_work.md).
+        _chains = ('downloads_url_chains.url, downloads_url_chains.chain_index '
+                   'FROM downloads, downloads_url_chains WHERE downloads_url_chains.id = downloads.id')
+        query = {
+            115: f'''SELECT downloads.id, downloads.received_bytes, downloads.total_bytes, downloads.state,
+                        downloads.start_time, downloads.end_time, downloads.opened, downloads.current_path,
+                        downloads.target_path, downloads.danger_type, downloads.interrupt_reason,
+                        downloads.referrer, downloads.by_ext_id, downloads.by_ext_name, downloads.etag,
+                        downloads.last_modified, downloads.mime_type, downloads.original_mime_type,
+                        downloads.guid, downloads.hash, downloads.http_method, downloads.site_url,
+                        downloads.tab_url, downloads.tab_referrer_url, downloads.last_access_time,
+                        downloads.transient, downloads.by_web_app_id, {_chains}''',
+            59:  f'''SELECT downloads.id, downloads.received_bytes, downloads.total_bytes, downloads.state,
+                        downloads.start_time, downloads.end_time, downloads.opened, downloads.current_path,
+                        downloads.target_path, downloads.danger_type, downloads.interrupt_reason,
+                        downloads.referrer, downloads.by_ext_id, downloads.by_ext_name, downloads.etag,
+                        downloads.last_modified, downloads.mime_type, downloads.original_mime_type,
+                        downloads.guid, downloads.hash, downloads.http_method, downloads.site_url,
+                        downloads.tab_url, downloads.tab_referrer_url, downloads.last_access_time,
+                        downloads.transient, {_chains}''',
+            51:  f'''SELECT downloads.id, downloads.received_bytes, downloads.total_bytes, downloads.state,
+                        downloads.start_time, downloads.end_time, downloads.opened, downloads.current_path,
+                        downloads.target_path, downloads.danger_type, downloads.interrupt_reason,
+                        downloads.referrer, downloads.by_ext_id, downloads.by_ext_name, downloads.etag,
+                        downloads.last_modified, downloads.mime_type, downloads.original_mime_type,
+                        downloads.guid, downloads.hash, downloads.http_method, downloads.site_url,
+                        downloads.tab_url, downloads.tab_referrer_url, {_chains}''',
+            37:  f'''SELECT downloads.id, downloads.received_bytes, downloads.total_bytes, downloads.state,
+                        downloads.start_time, downloads.end_time, downloads.opened, downloads.current_path,
+                        downloads.target_path, downloads.danger_type, downloads.interrupt_reason,
+                        downloads.referrer, downloads.by_ext_id, downloads.by_ext_name, downloads.etag,
+                        downloads.last_modified, downloads.mime_type, downloads.original_mime_type, {_chains}''',
+            30:  f'''SELECT downloads.id, downloads.received_bytes, downloads.total_bytes, downloads.state,
+                        downloads.start_time, downloads.end_time, downloads.opened, downloads.current_path,
+                        downloads.target_path, downloads.danger_type, downloads.interrupt_reason,
+                        downloads.referrer, downloads.by_ext_id, downloads.by_ext_name, downloads.etag,
+                        downloads.last_modified, {_chains}''',
+            29:  f'''SELECT downloads.id, downloads.received_bytes, downloads.total_bytes, downloads.state,
+                        downloads.start_time, downloads.end_time, downloads.opened, downloads.current_path,
+                        downloads.target_path, downloads.danger_type, downloads.interrupt_reason,
+                        downloads.referrer, {_chains}''',
+            26:  f'''SELECT downloads.id, downloads.received_bytes, downloads.total_bytes, downloads.state,
+                        downloads.start_time, downloads.end_time, downloads.opened, downloads.current_path,
+                        downloads.target_path, downloads.danger_type, downloads.interrupt_reason, {_chains}''',
+            16:  '''SELECT downloads.id, downloads.url, downloads.received_bytes, downloads.total_bytes,
+                        downloads.state, downloads.full_path, downloads.start_time, downloads.end_time,
+                        downloads.opened
+                    FROM downloads''',
+            1:   '''SELECT downloads.id, downloads.url, downloads.received_bytes, downloads.total_bytes,
+                        downloads.state, downloads.full_path, downloads.start_time
+                    FROM downloads'''}
 
         source_item = os.path.relpath(os.path.join(path, database), self.profile_path)
         with self._execute_compatible_query(
@@ -564,18 +631,42 @@ class Chrome(WebBrowser):
             if cursor is None:
                 return
 
+            # The downloads_url_chains join returns one row per redirect hop; collapse to one
+            # entry per download, collecting the full URL chain (final hop = download URL).
+            # Like the shared_proto_db parser, the chain is surfaced in the Interpretation
+            # (via url_chain) rather than as duplicate rows.
+            downloads_by_id = {}  # id -> {'row': first row, 'chain': {chain_index: url}}
             for row in cursor:
+                acc = downloads_by_id.setdefault(row.get('id'), {'row': row, 'chain': {}})
+                if row.get('url'):
+                    idx = row.get('chain_index')
+                    acc['chain'][idx if idx is not None else 0] = row.get('url')
+
+            for download_id, acc in downloads_by_id.items():
+                row = acc['row']
+                ordered_chain = [acc['chain'][i] for i in sorted(acc['chain'])]
+                final_url = ordered_chain[-1] if ordered_chain else row.get('url')
                 try:
-                    # TODO: collapse download chain into one entry per download
+                    h = row.get('hash')
+                    hash_hex = h.hex() if isinstance(h, (bytes, bytearray)) and any(h) else None
+                    lat = row.get('last_access_time')
                     new_row = Chrome.DownloadItem(
-                        self.profile_path, row.get('id'), row.get('url'), row.get('received_bytes'),
+                        self.profile_path, download_id, final_url, row.get('received_bytes'),
                         row.get('total_bytes'), row.get('state'), row.get('full_path'),
                         utils.to_datetime(row.get('start_time'), self.timezone),
                         utils.to_datetime(row.get('end_time'), self.timezone), row.get('target_path'),
                         row.get('current_path'), row.get('opened'), row.get('danger_type'),
                         row.get('interrupt_reason'), row.get('etag'), row.get('last_modified'),
-                        row.get('chain_index'))
-                except:
+                        None,  # chain collapsed into url_chain below
+                        guid=row.get('guid'), hash=hash_hex, http_method=row.get('http_method'),
+                        referrer=row.get('referrer'), site_url=row.get('site_url'),
+                        tab_url=row.get('tab_url'), tab_referrer_url=row.get('tab_referrer_url'),
+                        mime_type=row.get('mime_type'), original_mime_type=row.get('original_mime_type'),
+                        last_access_time=(utils.to_datetime(lat, self.timezone, none_if_unset=True) if lat else None),
+                        transient=row.get('transient'), by_ext_id=row.get('by_ext_id'),
+                        by_ext_name=row.get('by_ext_name'), by_web_app_id=row.get('by_web_app_id'),
+                        url_chain=ordered_chain if len(ordered_chain) > 1 else None)
+                except Exception:
                     log.exception(' - Exception processing record; skipped.')
                     continue
 
@@ -595,9 +686,19 @@ class Chrome(WebBrowser):
                     new_row.value = 'Error retrieving download location'
                     log.error(f' - Error retrieving download location for download "{new_row.url}"')
 
+                new_row.interpretation = self._download_interpretation(new_row)
                 new_row.row_type = row_type
                 new_row.source_item = source_item
                 results.append(new_row)
+
+                # Emit a second Timeline row for the last-access ("opened") event, dated at
+                # last_access_time, so it appears separately from the download (start) time.
+                if new_row.last_access_time is not None \
+                        and new_row.last_access_time != new_row.start_time:
+                    opened_row = copy.copy(new_row)
+                    opened_row.timestamp = new_row.last_access_time
+                    opened_row.row_type = f'{row_type} (opened)'
+                    results.append(opened_row)
 
         self.artifacts_counts[database + '_downloads'] = len(results)
         log.info(f' - Parsed {len(results)} items')
