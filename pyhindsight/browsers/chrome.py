@@ -160,8 +160,10 @@ class Chrome(WebBrowser):
             if 'downloads' in list(self.structure['History'].keys()):
                 trim_lesser_versions_if('target_path', self.structure['History']['downloads'], 26)
                 trim_lesser_versions_if('opened', self.structure['History']['downloads'], 16)
+                trim_lesser_versions_if('referrer', self.structure['History']['downloads'], 29)
                 trim_lesser_versions_if('etag', self.structure['History']['downloads'], 30)
                 trim_lesser_versions_if('original_mime_type', self.structure['History']['downloads'], 37)
+                trim_lesser_versions_if('tab_url', self.structure['History']['downloads'], 51)
                 trim_lesser_versions_if('last_access_time', self.structure['History']['downloads'], 59)
                 trim_lesser_versions_if('by_web_app_id', self.structure['History']['downloads'], 115)
             if 'downloads_slices' in list(self.structure['History'].keys()):

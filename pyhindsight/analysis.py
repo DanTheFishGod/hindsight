@@ -2509,7 +2509,8 @@ class AnalysisSession(object):
                 'interpretation TEXT, profile TEXT, source_item TEXT, visit_source TEXT, '
                 'visit_id INT, from_visit INT, opener_visit INT, '
                 'visit_duration TEXT, visit_count INT, typed_count INT, url_hidden INT, transition TEXT, '
-                'interrupt_reason TEXT, danger_type TEXT, opened INT, etag TEXT, last_modified TEXT, http_headers TEXT)')
+                'interrupt_reason TEXT, danger_type TEXT, opened INT, etag TEXT, last_modified TEXT, http_headers TEXT, '
+                'mime_type TEXT, referrer TEXT, tab_url TEXT, download_source TEXT, hash TEXT, guid TEXT)')
 
             c.execute(
                 'CREATE TABLE storage(type TEXT, origin TEXT, key TEXT, value TEXT, '
@@ -2582,11 +2583,15 @@ class AnalysisSession(object):
                 elif item.row_type.startswith('download'):
                     c.execute(
                         'INSERT INTO timeline (type, timestamp, url, title, value, interpretation, profile, source_item, '
-                        'interrupt_reason, danger_type, opened, etag, last_modified) '
-                        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                        'interrupt_reason, danger_type, opened, etag, last_modified, '
+                        'mime_type, referrer, tab_url, download_source, hash, guid) '
+                        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                         (item.row_type, friendly_date(item.timestamp), item.url, item.status_friendly, item.value,
                          item.interpretation, item.profile, item.source_item, item.interrupt_reason_friendly,
-                         item.danger_type_friendly, item.opened, item.etag, item.last_modified))
+                         item.danger_type_friendly, item.opened, item.etag, item.last_modified,
+                         getattr(item, 'mime_type', None), getattr(item, 'referrer', None),
+                         getattr(item, 'tab_url', None), getattr(item, 'download_source', None),
+                         getattr(item, 'hash', None), getattr(item, 'guid', None)))
 
                 elif item.row_type.startswith('bookmark folder'):
                     c.execute(
