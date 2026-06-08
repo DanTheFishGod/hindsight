@@ -603,6 +603,141 @@ class Chrome(WebBrowser):
         log.info(f' - Parsed {len(results)} items')
         self.parsed_artifacts.extend(results)
 
+    def get_shared_proto_db_downloads(self, path, dir_name):
+        # Downloads persisted by Chrome's in-progress DownloadDB in the shared_proto_db
+        # LevelDB. Records are keyed "<client_id>_<guid>"; the download client id is "21".
+        # Values are serialized download_pb.DownloadDBEntry protos.
+        # From https://source.chromium.org/chromium/chromium/src/+/main:components/download/database/proto/download_entry.proto
+        from pyhindsight.lib.proto.components.download.database.proto.download_entry_pb2 import DownloadDBEntry
+        from pyhindsight.lib.proto.content.browser.download.embedder_download_data_pb2 import EmbedderDownloadData
+
+        # download_pb.DownloadSource (how the download was triggered) -> human-readable.
+        # From https://source.chromium.org/chromium/chromium/src/+/main:components/download/database/proto/download_source.proto
+        DOWNLOAD_SOURCES = {
+            0: 'Unknown', 1: 'Navigation', 2: 'Drag and drop', 3: 'From renderer',
+            4: 'Extension API', 5: 'Extension installer', 6: 'Internal API',
+            7: 'Web contents API', 8: 'Offline page', 9: 'Context menu', 10: 'Retry',
+            11: 'Retry from bubble', 12: 'Toolbar menu',
+        }
+
+        results = []
+        ldb_path = os.path.join(path, dir_name)
+        log.info('Downloads (shared_proto_db):')
+        log.info(f' - Reading from {ldb_path}')
+        source_item = os.path.relpath(ldb_path, self.profile_path)
+
+        if not os.path.isdir(ldb_path):
+            log.error(f' - {ldb_path} is not a directory')
+            self.artifacts_counts['shared_proto_db downloads'] = 'Failed'
+            return
+
+        def decode_string16_pickle(raw):
+            # target_path/current_path are serialized base::Pickle string16 blobs:
+            # <uint32 pickle payload length><uint32 char count><UTF-16-LE chars>...
+            if not raw or len(raw) < 8:
+                return None
+            try:
+                _payload_len, char_count = struct.unpack('<II', raw[:8])
+                return raw[8:8 + (char_count * 2)].decode('utf-16-le', 'replace')
+            except Exception:
+                return None
+
+        try:
+            ldb_records = ccl_chromium_reader.storage_formats.ccl_leveldb.RawLevelDb(pathlib.Path(ldb_path))
+        except ValueError as e:
+            log.warning(f' - Error reading records ({e}); possible LevelDB corruption')
+            self.artifacts_counts['shared_proto_db downloads'] = 'Failed'
+            return
+
+        # Keep the latest (highest-seq) Live record per download guid; the in-progress DB
+        # rewrites a download's entry as it progresses, so earlier records are partial
+        # snapshots (empty target path, no end time, etc.).
+        latest_by_guid = {}
+        for record in ldb_records.iterate_records_raw():
+            if record.state.name != 'Live':
+                continue
+            if not record.user_key.startswith(b'21_'):
+                continue
+            try:
+                entry = DownloadDBEntry.FromString(record.value)
+            except Exception as e:
+                log.debug(f' - Could not decode a shared_proto_db download record: {e}')
+                continue
+            guid = entry.download_info.guid
+            if guid not in latest_by_guid or record.seq > latest_by_guid[guid][0]:
+                latest_by_guid[guid] = (record.seq, entry)
+        ldb_records.close()
+
+        for guid, (seq, entry) in latest_by_guid.items():
+            di = entry.download_info
+            ip = di.in_progress_info
+            try:
+                # How the download was triggered (ukm_info.download_source); History has no
+                # equivalent column. Skip the UNKNOWN(0)/absent default.
+                download_source = None
+                if di.HasField('ukm_info') and di.ukm_info.download_source:
+                    download_source = DOWNLOAD_SOURCES.get(
+                        di.ukm_info.download_source, str(di.ukm_info.download_source))
+
+                # Non-default storage partition => download from an extension / isolated
+                # context. serialized_embedder_download_data is the empty default otherwise.
+                storage_partition = None
+                if ip.serialized_embedder_download_data:
+                    try:
+                        spc = EmbedderDownloadData.FromString(
+                            ip.serialized_embedder_download_data).storage_partition_config
+                        if spc.partition_domain or spc.partition_name:
+                            storage_partition = (f'{spc.partition_domain}/{spc.partition_name}'
+                                                 + (' (in-memory)' if spc.in_memory else ''))
+                    except Exception:
+                        pass
+
+                request_headers = {h.key: h.value for h in ip.request_headers} or None
+
+                new_row = Chrome.DownloadItem(
+                    self.profile_path, download_id=guid,
+                    url=ip.url_chain[-1] if ip.url_chain else '',
+                    received_bytes=ip.received_bytes, total_bytes=ip.total_bytes, state=ip.state,
+                    full_path=None,
+                    start_time=utils.to_datetime(ip.start_time, self.timezone, none_if_unset=True),
+                    end_time=utils.to_datetime(ip.end_time, self.timezone, none_if_unset=True),
+                    target_path=decode_string16_pickle(ip.target_path),
+                    current_path=decode_string16_pickle(ip.current_path),
+                    danger_type=ip.danger_type, interrupt_reason=ip.interrupt_reason,
+                    etag=ip.etag or None, last_modified=ip.last_modified or None,
+                    # Fields overlapping the History downloads schema (parity).
+                    guid=guid, hash=ip.hash.hex() if ip.hash else None,
+                    referrer=ip.referrer_url or None, site_url=ip.site_url or None,
+                    tab_url=ip.tab_url or None, tab_referrer_url=ip.tab_referrer_url or None,
+                    mime_type=ip.mime_type or None, original_mime_type=ip.original_mime_type or None,
+                    transient=ip.transient or None,
+                    # shared_proto_db-only extras.
+                    download_source=download_source,
+                    url_chain=list(ip.url_chain) if len(ip.url_chain) > 1 else None,
+                    request_headers=request_headers,
+                    fetched_via_service_worker=ip.fetched_via_service_worker or None,
+                    storage_partition=storage_partition)
+            except Exception:
+                log.exception(' - Exception processing shared_proto_db download; skipped.')
+                continue
+
+            new_row.decode_interrupt_reason()
+            new_row.decode_danger_type()
+            new_row.decode_download_state()
+            new_row.timestamp = new_row.start_time
+            new_row.create_friendly_status()
+
+            new_row.value = new_row.target_path or new_row.current_path \
+                or 'Error retrieving download location'
+            new_row.interpretation = self._download_interpretation(new_row)
+            new_row.row_type = 'download (shared_proto_db)'
+            new_row.source_item = source_item
+            results.append(new_row)
+
+        self.artifacts_counts['shared_proto_db downloads'] = len(results)
+        log.info(f' - Parsed {len(results)} items')
+        self.parsed_artifacts.extend(results)
+
     def decrypt_cookie(self, encrypted_value):
         """Decryption based on work by Nathan Henrie and Jordan Wright as well as Chromium source:
          - Mac/Linux: http://n8henrie.com/2014/05/decrypt-chrome-cookies-with-python/
@@ -4358,7 +4493,7 @@ class Chrome(WebBrowser):
         supported_databases = ['History', 'Archived History', 'Media History', 'Web Data', 'Cookies',
                                'Login Data', 'Login Data For Account'
                                'Extension Cookies', 'Network Action Predictor', 'DIPS']
-        supported_subdirs = ['Local Storage', 'Extensions', 'File System', 'Platform Notifications', 'Network', 'Sessions', 'Service Worker']
+        supported_subdirs = ['Local Storage', 'Extensions', 'File System', 'Platform Notifications', 'Network', 'Sessions', 'Service Worker', 'shared_proto_db']
         supported_jsons = ['Bookmarks', 'TransportSecurity']  # , 'Preferences']
         supported_items = supported_databases + supported_subdirs + supported_jsons
         log.debug(f'Supported items: {supported_items}')
@@ -4494,6 +4629,13 @@ class Chrome(WebBrowser):
                     'Download', 'History_downloads', self.get_downloads,
                     self.profile_path, 'History', self.version, 'download',
                     display_key='History_downloads', display_value=f'Download records')
+
+            if 'shared_proto_db' in input_listing:
+                run_with_status(
+                    'Downloads (shared_proto_db)', 'shared_proto_db downloads',
+                    self.get_shared_proto_db_downloads, self.profile_path, 'shared_proto_db',
+                    display_key='shared_proto_db downloads',
+                    display_value='shared_proto_db download records')
 
             if 'Archived History' in input_listing:
                 run_with_status(
@@ -4771,14 +4913,14 @@ class Chrome(WebBrowser):
                 self, profile, download_id, url, received_bytes, total_bytes, state, full_path=None, start_time=None,
                 end_time=None, target_path=None, current_path=None, opened=None, danger_type=None,
                 interrupt_reason=None, etag=None, last_modified=None, chain_index=None, interrupt_reason_friendly=None,
-                danger_type_friendly=None, state_friendly=None, status_friendly=None):
+                danger_type_friendly=None, state_friendly=None, status_friendly=None, **extra_fields):
             WebBrowser.DownloadItem.__init__(
                 self, profile, download_id, url, received_bytes, total_bytes, state, full_path=full_path,
                 start_time=start_time, end_time=end_time, target_path=target_path, current_path=current_path,
                 opened=opened, danger_type=danger_type, interrupt_reason=interrupt_reason, etag=etag,
                 last_modified=last_modified, chain_index=chain_index,
                 interrupt_reason_friendly=interrupt_reason_friendly, danger_type_friendly=danger_type_friendly,
-                state_friendly=state_friendly, status_friendly=status_friendly)
+                state_friendly=state_friendly, status_friendly=status_friendly, **extra_fields)
 
         def decode_interrupt_reason(self):
             interrupts = {

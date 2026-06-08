@@ -251,7 +251,12 @@ class WebBrowser(object):
                 self, profile, download_id, url, received_bytes, total_bytes, state, full_path=None, start_time=None,
                 end_time=None, target_path=None, current_path=None, opened=None, danger_type=None,
                 interrupt_reason=None, etag=None, last_modified=None, chain_index=None, interrupt_reason_friendly=None,
-                danger_type_friendly=None, state_friendly=None, status_friendly=None):
+                danger_type_friendly=None, state_friendly=None, status_friendly=None,
+                guid=None, hash=None, http_method=None, referrer=None, site_url=None, tab_url=None,
+                tab_referrer_url=None, mime_type=None, original_mime_type=None, last_access_time=None,
+                transient=None, by_ext_id=None, by_ext_name=None, by_web_app_id=None,
+                embedder_download_data=None, download_source=None, url_chain=None,
+                request_headers=None, fetched_via_service_worker=None, storage_partition=None):
             super(WebBrowser.DownloadItem, self).__init__('download', timestamp=start_time, profile=profile, url=url)
             self.profile = profile
             self.download_id = download_id
