@@ -96,10 +96,25 @@ class MyEncoder(json.JSONEncoder):
             return obj.__dict__
 
 
-def to_datetime(timestamp, timezone=None, quiet=False):
-    """Convert a variety of timestamp formats to a datetime object."""
+def to_datetime(timestamp, timezone=None, quiet=False, none_if_unset=False):
+    """Convert a variety of timestamp formats to a datetime object.
+
+    If none_if_unset is True, the common Chrome "unset" sentinels -- 0 and the
+    all-ones value (0xffffffffffffffff / UINT64_MAX) -- return None instead of being
+    converted to 1601/1970 or datetime.max. Off by default to preserve existing behavior
+    (callers and the Timeline rely on 0 -> epoch, and sorting requires a real datetime).
+    """
 
     try:
+        if none_if_unset:
+            if timestamp is None:
+                return None
+            try:
+                if int(timestamp) in (0, 0xffffffffffffffff):
+                    return None
+            except (TypeError, ValueError):
+                pass  # not an integer-like value (e.g. a datetime or unparseable string)
+
         if isinstance(timestamp, datetime.datetime):
             if timezone is not None:
                 return timestamp.astimezone(timezone)

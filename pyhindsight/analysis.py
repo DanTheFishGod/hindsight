@@ -175,7 +175,8 @@ class HindsightEncoder(json.JSONEncoder):
         if isinstance(obj, Chrome.DownloadItem):
             item = HindsightEncoder.base_encoder(obj)
 
-            item['timestamp_desc'] = 'File Downloaded'
+            item['timestamp_desc'] = 'Last Access Time' \
+                if '(opened)' in (getattr(obj, 'row_type', '') or '') else 'File Downloaded'
             item['data_type'] = 'chrome:history:file_downloaded'
 
             item['message'] = f"{item['url']} " \
@@ -998,8 +999,8 @@ class AnalysisSession(object):
         # Title bar
         w.merge_range('A1:I1', f'Hindsight Internet History Forensics (v{__version__}) - Timeline', title_header_format)
         w.merge_range('J1:W1', 'URL Visit Specific', center_header_format)
-        w.merge_range('X1:Z1', 'Download Specific', center_header_format)
-        w.merge_range('AA1:AC1', 'Cache Specific', center_header_format)
+        w.merge_range('X1:AC1', 'Download Specific', center_header_format)
+        w.merge_range('AD1:AF1', 'Cache Specific', center_header_format)
 
         # Write column headers
         w.write(1, 0, 'Type', header_format)
@@ -1028,9 +1029,12 @@ class AnalysisSession(object):
         w.write(1, 23, 'Interrupt Reason', header_format)
         w.write(1, 24, 'Danger Type', header_format)
         w.write(1, 25, 'Opened?', header_format)
-        w.write(1, 26, 'ETag', header_format)
-        w.write(1, 27, 'Last Modified', header_format)
-        w.write(1, 28, 'All HTTP Headers', header_format)
+        w.write(1, 26, 'MIME Type', header_format)
+        w.write(1, 27, 'Referrer', header_format)
+        w.write(1, 28, 'Tab URL', header_format)
+        w.write(1, 29, 'ETag', header_format)
+        w.write(1, 30, 'Last Modified', header_format)
+        w.write(1, 31, 'All HTTP Headers', header_format)
 
         # Set column widths
         w.set_column('A:A', 16)  # Type
@@ -1058,13 +1062,16 @@ class AnalysisSession(object):
         w.set_column('X:X', 12)  # Interrupt Reason
         w.set_column('Y:Y', 24)  # Danger Type
         w.set_column('Z:Z', 12)  # Opened
+        w.set_column('AA:AA', 25)  # MIME Type
+        w.set_column('AB:AB', 40)  # Referrer
+        w.set_column('AC:AC', 40)  # Tab URL
 
         # Common between Downloads and Cache
-        w.set_column('AA:AA', 12)  # ETag
-        w.set_column('AB:AB', 27)  # Last Modified
+        w.set_column('AD:AD', 12)  # ETag
+        w.set_column('AE:AE', 27)  # Last Modified
 
         # Cache Specific
-        w.set_column('AC:AC', 30)  # HTTP Headers
+        w.set_column('AF:AF', 30)  # HTTP Headers
 
         # Start at the row after the headers and begin writing out the items in parsed_artifacts
         row_number = 2
@@ -1130,19 +1137,22 @@ class AnalysisSession(object):
                     w.write_string(row_number, 2, item.url, green_url_format)  # download URL
                     w.write_string(row_number, 3, item.status_friendly, green_field_format)  # % complete
                     w.write_string(row_number, 4, item.value, green_value_format)  # download path
-                    w.write_string(row_number, 5, "", green_field_format)  # Interpretation (chain?)
+                    w.write_string(row_number, 5, item.interpretation or "", green_field_format)  # Interpretation (e.g. initiating tab URL)
                     w.write(row_number, 6, item.profile, green_type_format)  # Profile
                     w.write(row_number, 7, item.source_item or '', green_type_format)  # Source Item
                     w.write(row_number, 23, item.interrupt_reason_friendly, green_value_format)  # interrupt reason
                     w.write(row_number, 24, item.danger_type_friendly, green_value_format)  # danger type
+                    w.write(row_number, 26, getattr(item, 'mime_type', None), green_value_format)  # MIME Type
+                    w.write(row_number, 27, getattr(item, 'referrer', None), green_value_format)  # Referrer
+                    w.write(row_number, 28, getattr(item, 'tab_url', None), green_value_format)  # Tab URL
                     open_friendly = ""
                     if item.opened == 1:
                         open_friendly = 'Yes'
                     elif item.opened == 0:
                         open_friendly = 'No'
                     w.write_string(row_number, 25, open_friendly, green_value_format)  # opened
-                    w.write(row_number, 26, item.etag, green_value_format)  # ETag
-                    w.write(row_number, 27, item.last_modified, green_value_format)  # Last Modified
+                    w.write(row_number, 29, item.etag, green_value_format)  # ETag
+                    w.write(row_number, 30, item.last_modified, green_value_format)  # Last Modified
 
                 elif item.row_type.startswith("bookmark folder"):
                     w.write_string(row_number, 0, item.row_type, red_type_format)  # record_type
@@ -1183,9 +1193,9 @@ class AnalysisSession(object):
                     w.write(row_number, 5, item.interpretation, gray_value_format)  # cookie interpretation
                     w.write(row_number, 6, item.profile, gray_value_format)  # Profile
                     w.write(row_number, 7, item.source_item or '', gray_value_format)  # Source Item
-                    w.write(row_number, 26, item.etag, gray_value_format)  # ETag
-                    w.write(row_number, 27, item.last_modified, gray_value_format)  # Last Modified
-                    w.write(row_number, 28, item.http_headers_str, gray_value_format)  # headers
+                    w.write(row_number, 29, item.etag, gray_value_format)  # ETag
+                    w.write(row_number, 30, item.last_modified, gray_value_format)  # Last Modified
+                    w.write(row_number, 31, item.http_headers_str, gray_value_format)  # headers
 
                 elif item.row_type.startswith("local storage"):
                     w.write_string(row_number, 0, item.row_type, gray_type_format)  # record_type
@@ -1352,7 +1362,7 @@ class AnalysisSession(object):
 
         # Formatting
         w.freeze_panes(2, 0)  # Freeze top row
-        w.autofilter(1, 0, row_number, 28)  # Add autofilter
+        w.autofilter(1, 0, row_number, 31)  # Add autofilter
         w.filter_column('B', 'Timestamp > 1970-01-02')
 
         ##############################
@@ -2499,7 +2509,8 @@ class AnalysisSession(object):
                 'interpretation TEXT, profile TEXT, source_item TEXT, visit_source TEXT, '
                 'visit_id INT, from_visit INT, opener_visit INT, '
                 'visit_duration TEXT, visit_count INT, typed_count INT, url_hidden INT, transition TEXT, '
-                'interrupt_reason TEXT, danger_type TEXT, opened INT, etag TEXT, last_modified TEXT, http_headers TEXT)')
+                'interrupt_reason TEXT, danger_type TEXT, opened INT, etag TEXT, last_modified TEXT, http_headers TEXT, '
+                'mime_type TEXT, referrer TEXT, tab_url TEXT, download_source TEXT, hash TEXT, guid TEXT)')
 
             c.execute(
                 'CREATE TABLE storage(type TEXT, origin TEXT, key TEXT, value TEXT, '
@@ -2572,11 +2583,15 @@ class AnalysisSession(object):
                 elif item.row_type.startswith('download'):
                     c.execute(
                         'INSERT INTO timeline (type, timestamp, url, title, value, interpretation, profile, source_item, '
-                        'interrupt_reason, danger_type, opened, etag, last_modified) '
-                        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                        'interrupt_reason, danger_type, opened, etag, last_modified, '
+                        'mime_type, referrer, tab_url, download_source, hash, guid) '
+                        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                         (item.row_type, friendly_date(item.timestamp), item.url, item.status_friendly, item.value,
                          item.interpretation, item.profile, item.source_item, item.interrupt_reason_friendly,
-                         item.danger_type_friendly, item.opened, item.etag, item.last_modified))
+                         item.danger_type_friendly, item.opened, item.etag, item.last_modified,
+                         getattr(item, 'mime_type', None), getattr(item, 'referrer', None),
+                         getattr(item, 'tab_url', None), getattr(item, 'download_source', None),
+                         getattr(item, 'hash', None), getattr(item, 'guid', None)))
 
                 elif item.row_type.startswith('bookmark folder'):
                     c.execute(

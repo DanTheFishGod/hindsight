@@ -251,7 +251,12 @@ class WebBrowser(object):
                 self, profile, download_id, url, received_bytes, total_bytes, state, full_path=None, start_time=None,
                 end_time=None, target_path=None, current_path=None, opened=None, danger_type=None,
                 interrupt_reason=None, etag=None, last_modified=None, chain_index=None, interrupt_reason_friendly=None,
-                danger_type_friendly=None, state_friendly=None, status_friendly=None):
+                danger_type_friendly=None, state_friendly=None, status_friendly=None,
+                guid=None, hash=None, http_method=None, referrer=None, site_url=None, tab_url=None,
+                tab_referrer_url=None, mime_type=None, original_mime_type=None, last_access_time=None,
+                transient=None, by_ext_id=None, by_ext_name=None, by_web_app_id=None,
+                embedder_download_data=None, download_source=None, url_chain=None,
+                request_headers=None, fetched_via_service_worker=None, storage_partition=None):
             super(WebBrowser.DownloadItem, self).__init__('download', timestamp=start_time, profile=profile, url=url)
             self.profile = profile
             self.download_id = download_id
@@ -274,6 +279,31 @@ class WebBrowser(object):
             self.danger_type_friendly = danger_type_friendly
             self.state_friendly = state_friendly
             self.status_friendly = status_friendly
+            # Additional columns present in newer History `downloads` schemas (see the
+            # column->version map in get_downloads).
+            self.guid = guid
+            self.hash = hash
+            self.http_method = http_method
+            self.referrer = referrer
+            self.site_url = site_url
+            self.tab_url = tab_url
+            self.tab_referrer_url = tab_referrer_url
+            self.mime_type = mime_type
+            self.original_mime_type = original_mime_type
+            self.last_access_time = last_access_time
+            self.transient = transient
+            self.by_ext_id = by_ext_id
+            self.by_ext_name = by_ext_name
+            self.by_web_app_id = by_web_app_id
+            self.embedder_download_data = embedder_download_data
+            # How the download was triggered (download_pb.DownloadSource); only available
+            # from shared_proto_db's ukm_info, not the History downloads table.
+            self.download_source = download_source
+            # shared_proto_db-only extras (not in the History downloads table):
+            self.url_chain = url_chain                          # full redirect chain (list)
+            self.request_headers = request_headers              # outbound HTTP headers (dict)
+            self.fetched_via_service_worker = fetched_via_service_worker
+            self.storage_partition = storage_partition          # non-default partition (extension/isolated)
 
     class CookieItem(HistoryItem):
         def __init__(self, profile, host_key, path, name, value, creation_utc, last_access_utc, secure, http_only,
