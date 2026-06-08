@@ -1,7 +1,7 @@
 argparse~=1.4.0
 bottle>=0.12.18
 keyring>=21.2.1
-protobuf>=6.31
+protobuf>=6.33.2
 puremagic~=1.11
 pycryptodome>=3.9.7
 pycryptodomex>=3.9.7

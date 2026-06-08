@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 37,
+  "addons": [
+    {
+      "id": "uBlock0@raymondhill.net",
+      "version": "1.55.0",
+      "type": "extension",
+      "active": true,
+      "userDisabled": false,
+      "appDisabled": false,
+      "signedState": 2,
+      "sourceURI": "https://addons.mozilla.org/firefox/downloads/file/4188948/ublock_origin-1.55.0.xpi",
+      "location": "app-profile",
+      "path": "C:\\Users\\test\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\test.default\\extensions\\uBlock0@raymondhill.net.xpi",
+      "rootURI": "jar:file:///C:/Users/test/AppData/Roaming/Mozilla/Firefox/Profiles/test.default/extensions/uBlock0@raymondhill.net.xpi!/",
+      "installDate": 1705320000000,
+      "updateDate": 1705924800000,
+      "defaultLocale": {
+        "name": "uBlock Origin",
+        "description": "Finally, an efficient blocker."
+      },
+      "userPermissions": {
+        "permissions": [
+          "storage",
+          "webRequest"
+        ],
+        "origins": [
+          "<all_urls>"
+        ]
+      }
+    }
+  ]
+}

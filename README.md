@@ -1,9 +1,11 @@
 <img src="./pyhindsight/static/h.png" height="100px"/> Hindsight
 =========
 
-Internet history forensics for Google Chrome/Chromium
+Internet history forensics for Google Chrome/Chromium and Mozilla Firefox
 
-Hindsight is a free tool for analyzing web artifacts. It started with the browsing history of the Google Chrome web browser and has expanded to support other Chromium-based applications (with more to come!). Hindsight can parse a number of different types of web artifacts, including URLs, download history, cache records, bookmarks, autofill records, saved passwords, preferences, browser extensions, HTTP cookies, and Local Storage records (HTML5 cookies). Once the data is extracted from each file, it is correlated with data from other history files and placed in a timeline.
+Hindsight is a free tool for analyzing web artifacts. It started with the browsing history of the Google Chrome web browser, has expanded to support other Chromium-based applications, and now also parses Mozilla Firefox profiles. Hindsight can parse a number of different types of web artifacts, including URLs, download history, cache records, bookmarks, autofill records, saved passwords, preferences, browser extensions, HTTP cookies, and Local Storage records (HTML5 cookies). Once the data is extracted from each file, it is correlated with data from other history files and placed in a timeline.
+
+For Firefox profiles, Hindsight parses ``places.sqlite`` (history visits, bookmarks, and downloads), ``cookies.sqlite``, and ``formhistory.sqlite``. Select "Firefox" in the GUI or pass ``-b Firefox`` on the command line, pointing at a profile directory such as ``\[userdir]\AppData\Roaming\Mozilla\Firefox\Profiles\<profile>``.
 
 It has a simple web UI - to start it, run "hindsight_gui.py" (or on Windows, the packaged "hindsight_gui.exe") and visit http://localhost:8080 in a browser:  
 
@@ -38,7 +40,7 @@ Command Line Options:
 | -o or --output | Name of the output file (without extension) |
 | -f or --format | Output format (default is XLSX, other options are SQLite and JSONL) |
 | -c or --cache  | Path to the cache directory; only needed if the directory is outside the given "input" directory. Mac systems are setup this way by default. |
-| -b or --browser_type | The type of browser the input files belong to. Supported options are Chrome (default) and Brave.
+| -b or --browser_type | The type of browser the input files belong to. Supported options are Chrome (default) and Firefox.
 | -l or --log	 | Location Hindsight should log to (will append if exists) |
 | -h or --help   | Shows these options and the default Chrome data locations |
 | -t or --timezone | Display timezone for the timestamps in XLSX output |
