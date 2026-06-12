@@ -7,6 +7,7 @@ against the data, and then outputs the results in a spreadsheet.
 """
 
 import argparse
+import collections
 import datetime
 import importlib
 import logging
@@ -74,8 +75,11 @@ The Chrome Profile folder default locations are:
                         help='Path to the Chrome(ium) profile directory (typically "Default"). If a higher-level '
                              'directory is specified instead, Hindsight will recursively search for profiles.', )
     parser.add_argument('-o', '--output', help='Name of the output file (without extension)')
-    parser.add_argument('-b', '--browser_type', help='Type of input files', default='Chrome',
-                        choices=['Chrome', 'Firefox'])
+    parser.add_argument('-b', '--browser_type',
+                        help='Force a browser family for every profile, overriding auto-detection '
+                             '(case-insensitive: Chrome, Firefox, Brave; Edge/Chromium map to Chrome). '
+                             'Omit to auto-detect each profile from its files.',
+                        default=None)
     parser.add_argument('-f', '--format', choices=analysis_session.available_output_formats,
                         default=analysis_session.available_output_formats[-1], help='Output format')
     parser.add_argument('-l', '--log', help='Location Hindsight should log to (will append if exists)',
@@ -225,6 +229,13 @@ def main():
     meta_table.add_row("Start time", start_time)
     meta_table.add_row("Input directory", args.input)
     meta_table.add_row("Profiles found", str(profile_count))
+    if args.browser_type:
+        meta_table.add_row("Browser type", f"{args.browser_type} (forced via -b)")
+    else:
+        families = collections.Counter(analysis_session.detected_profile_families.values())
+        if families:
+            detected = ", ".join(f"{count}× {family}" for family, count in sorted(families.items()))
+            meta_table.add_row("Detected", detected)
     console.print(rich.align.Align.center(meta_table))
     console.print()
     run_status = analysis_session.run()

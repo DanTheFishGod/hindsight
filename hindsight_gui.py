@@ -134,7 +134,9 @@ def do_run():
     analysis_session.selected_plugins = bottle.request.forms.getall('selected_plugins')
     analysis_session.input_path = bottle.request.forms.get('profile_path')  # TODO: refactor bottle name
     analysis_session.cache_path = bottle.request.forms.get('cache_path')
-    analysis_session.browser_type = bottle.request.forms.get('browser_type')
+    # Empty value = "Auto-detect" (per-profile detection); anything else forces an override.
+    browser_type = bottle.request.forms.get('browser_type')
+    analysis_session.browser_type = browser_type if browser_type else None
     analysis_session.timezone = bottle.request.forms.get('timezone')
     # Get base directory for resolving relative paths (exe dir for frozen apps)
     if getattr(sys, 'frozen', False):

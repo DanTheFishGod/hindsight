@@ -465,6 +465,8 @@ class AnalysisSession(object):
         self.hindsight_version = hindsight_version
         self.preferences = preferences
         self.fatal_error = None
+        # {profile_path: detected family}; populated by find_browser_profiles().
+        self.detected_profile_families = {}
 
         if self.version is None:
             self.version = []
@@ -596,21 +598,35 @@ class AnalysisSession(object):
         else:
             setattr(self, item_name, item_value)
 
+    # Canonical browser families a profile can be detected/dispatched as. Chromium
+    # variants (Edge, Brave, etc.) share the "Chrome" pipeline for now and are
+    # distinguished only by branding, not by which files are present.
+    BROWSER_TYPE_ALIASES = {
+        'chrome': 'Chrome',
+        'chromium': 'Chrome',
+        'edge': 'Chrome',
+        'firefox': 'Firefox',
+        'brave': 'Brave',
+    }
+
     @staticmethod
     def is_profile(base_path, existing_files, warn=False):
-        """Return True if `base_path` looks like a browser profile we can parse.
+        """Return the detected browser family for `base_path`, or None.
 
-        A Chromium profile has a ``History`` SQLite file; a Firefox profile has
-        ``places.sqlite``. Either is enough to consider this a profile.
+        A Chromium profile (Chrome/Edge/Brave/...) has a ``History`` SQLite file;
+        a Firefox profile has ``places.sqlite``. Returns the canonical family name
+        ('Chrome' or 'Firefox') so callers can dispatch per profile, or None if
+        neither marker is present. The return value is truthy for a recognized
+        profile and falsy otherwise, so existing boolean callers keep working.
         """
-        for required_file in ['History', 'places.sqlite']:
+        for required_file, family in (('History', 'Chrome'), ('places.sqlite', 'Firefox')):
             if required_file in existing_files and os.path.isfile(os.path.join(base_path, required_file)):
-                return True
+                return family
 
         if warn:
             log.warning(f"The profile directory {base_path} does not contain a recognized "
                         f"browser history file (History or places.sqlite). Analysis may not be very useful.")
-        return False
+        return None
 
     def search_subdirs(self, base_path):
         """Recursively search a path for browser profiles"""
@@ -622,8 +638,10 @@ class AnalysisSession(object):
             log.warning(f'Unable to read directory; Exception: {e}')
             return found_profile_paths
 
-        if self.is_profile(base_path, base_dir_listing):
+        family = self.is_profile(base_path, base_dir_listing)
+        if family:
             found_profile_paths.append(base_path)
+            self.detected_profile_families[base_path] = family
         for item in base_dir_listing:
             item_path = os.path.join(base_path, item)
             if os.path.isdir(item_path) and not os.path.islink(item_path):
@@ -633,14 +651,24 @@ class AnalysisSession(object):
         return found_profile_paths
 
     def find_browser_profiles(self, base_path):
-        """Search a path for browser profiles (only Chromium-based at the moment)."""
+        """Search a path for browser profiles, detecting each profile's browser family.
+
+        Records the detected family (Chrome/Firefox) per profile path in
+        ``self.detected_profile_families`` so ``run()`` can dispatch the right
+        pipeline per profile when no ``-b`` override is given.
+        """
+        # Reset detection state so a re-run (and the early count in hindsight.py)
+        # don't accumulate stale entries.
+        self.detected_profile_families = {}
         found_profile_paths = []
         base_dir_listing = os.listdir(base_path)
 
-        # The 'History' SQLite file is kind of the minimum required for most
-        # Chrome analysis. Warn if not present.
-        if self.is_profile(base_path, base_dir_listing, warn=True):
+        # A recognized history file (Chrome 'History' or Firefox 'places.sqlite')
+        # is the minimum required for useful analysis. Warn if not present.
+        family = self.is_profile(base_path, base_dir_listing, warn=True)
+        if family:
             found_profile_paths.append(base_path)
+            self.detected_profile_families[base_path] = family
 
         else:
             # Only search sub dirs if the current dir is not a Profile (Profiles are not nested).
@@ -681,6 +709,19 @@ class AnalysisSession(object):
 
         log.debug("Options: " + str(self.__dict__))
 
+        # Normalize the optional -b/--browser_type override. When set, it forces a
+        # single family for every discovered profile (case-insensitive); when unset,
+        # each profile's family is auto-detected by find_browser_profiles().
+        if self.browser_type:
+            normalized = self.BROWSER_TYPE_ALIASES.get(str(self.browser_type).strip().lower())
+            if not normalized:
+                self.fatal_error = (
+                    f"Unrecognized browser type '{self.browser_type}'. "
+                    f"Valid values: {', '.join(sorted(set(self.BROWSER_TYPE_ALIASES.values())))}.")
+                log.error(self.fatal_error)
+                return False
+            self.browser_type = normalized
+
         # Analysis start time
         log.info("Starting analysis")
 
@@ -705,7 +746,16 @@ class AnalysisSession(object):
 
         for found_profile_path in self.profile_paths:
 
-            if self.browser_type == "Chrome":
+            # An explicit -b override wins; otherwise use the per-profile detected
+            # family, defaulting to Chrome (covers the "process input path as a
+            # Profile" fallback, where no marker was found).
+            profile_browser_type = (
+                self.browser_type
+                or self.detected_profile_families.get(found_profile_path)
+                or "Chrome")
+            log.info(f' - Parsing profile {found_profile_path} as {profile_browser_type}')
+
+            if profile_browser_type == "Chrome":
                 browser_analysis = Chrome(found_profile_path, available_decrypts=self.available_decrypts,
                                           cache_path=self.cache_path, timezone=self.timezone,
                                           no_copy=self.no_copy, temp_dir=self.temp_dir,
@@ -716,7 +766,9 @@ class AnalysisSession(object):
                 self.parsed_extension_data.extend(browser_analysis.parsed_extension_data)
                 self.parsed_sync_data.extend(browser_analysis.parsed_sync_data)
                 self.artifacts_counts = self.sum_dict_counts(self.artifacts_counts, browser_analysis.artifacts_counts)
-                self.artifacts_display = browser_analysis.artifacts_display
+                if self.artifacts_display is None:
+                    self.artifacts_display = {}
+                self.artifacts_display.update(browser_analysis.artifacts_display)
                 self.version.extend(browser_analysis.version)
                 self.display_version = browser_analysis.display_version
                 self.preferences.extend(browser_analysis.preferences)
@@ -748,7 +800,7 @@ class AnalysisSession(object):
                         except Exception as e:
                             log.info(f'Exception occurred while analyzing {item} for analysis session promotion: {e}')
 
-            elif self.browser_type == "Firefox":
+            elif profile_browser_type == "Firefox":
                 browser_analysis = Firefox(found_profile_path, cache_path=self.cache_path,
                                            timezone=self.timezone,
                                            no_copy=self.no_copy, temp_dir=self.temp_dir)
@@ -756,7 +808,9 @@ class AnalysisSession(object):
                 self.parsed_artifacts.extend(browser_analysis.parsed_artifacts)
                 self.parsed_storage.extend(browser_analysis.parsed_storage)
                 self.artifacts_counts = self.sum_dict_counts(self.artifacts_counts, browser_analysis.artifacts_counts)
-                self.artifacts_display = browser_analysis.artifacts_display
+                if self.artifacts_display is None:
+                    self.artifacts_display = {}
+                self.artifacts_display.update(browser_analysis.artifacts_display)
                 self.version.extend(browser_analysis.version)
                 self.display_version = browser_analysis.display_version
                 self.preferences.extend(browser_analysis.preferences)
@@ -770,7 +824,7 @@ class AnalysisSession(object):
                         except Exception as e:
                             log.info(f'Exception occurred while analyzing {item} for analysis session promotion: {e}')
 
-            elif self.browser_type == "Brave":
+            elif profile_browser_type == "Brave":
                 browser_analysis = Brave(found_profile_path, timezone=self.timezone)
                 browser_analysis.process()
                 self.parsed_artifacts = browser_analysis.parsed_artifacts

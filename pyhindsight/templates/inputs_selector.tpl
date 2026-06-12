@@ -53,6 +53,7 @@
                                 <td class="input-option">
                                     <b>Input Type:</b>
                                     <select name="browser_type" onchange="toggle(this.value)">
+                                        <option value="">Auto-detect</option>
                                         <option value="Chrome">Chrome</option>
                                         <option value="Firefox">Firefox</option>
                                     </select>
