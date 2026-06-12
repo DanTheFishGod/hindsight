@@ -16,14 +16,6 @@ import shutil
 import puremagic
 import base64
 import ccl_chromium_reader
-import rich.console
-import rich.live
-import rich.spinner
-import rich.table
-import rich.columns
-import rich.align
-import rich.panel
-import rich.text
 
 from pyhindsight.browsers.webbrowser import WebBrowser
 from pyhindsight import utils
@@ -4636,181 +4628,105 @@ class Chrome(WebBrowser):
             if input_file in supported_items:
                 log.info(f' - {input_file}')
 
-        console = rich.console.Console()
-        output_groups = {}
         group_order = [
             "User Activity",
             "Website Storage",
             "Browser Extensions",
             "Configuration & Supporting Data",
         ]
-        current_group = group_order[0]
 
-        count_width = 7
-        table_width = 50  # Consistent width for tables and panel
-
-        def build_table(rows, header_label):
-            # Header row as separate table with center alignment
-            header = rich.table.Table(show_header=False, box=None, expand=False)
-            header.add_column(justify="left", width=table_width - count_width - 8, style="bold on #333333")
-            header.add_column(justify="center", width=count_width + 8, style="bold on #333333")
-            header.add_row(rich.text.Text(header_label, style="bold"), rich.text.Text("Count", style="bold"))
-
-            # Content table with right alignment
-            table = rich.table.Table(show_header=False, box=None, expand=False)
-            table.add_column(overflow="fold", justify="right", width=table_width - count_width - 8)
-            table.add_column(justify="center", width=count_width + 8, no_wrap=True)
-            for row_label, row_count in rows:
-                table.add_row(row_label, row_count)
-            return rich.console.Group(header, table)
-
-        def build_group_tables():
-            tables = []
-            for group_name in group_order:
-                rows = output_groups.get(group_name, [])
-                if not rows:
-                    continue
-                inner_table = build_table(rows, group_name)
-                tables.append(rich.align.Align.center(inner_table))
-                tables.append(rich.text.Text(""))  # Padding between groups
-            return rich.console.Group(*tables)
-
-        def build_profile_panel():
-            # Use a table with min_width so panel can expand for long paths
-            content = rich.table.Table(show_header=False, box=None, expand=False)
-            content.add_column(min_width=table_width, overflow="fold")
-            content.add_row(f"Path: {self.profile_path}")
-            content.add_row(f"Detected Browser: {self.browser_name} v{self.display_version}")
-            return rich.align.Align.center(rich.panel.Panel(content, title="Profile", border_style="green", padding=(0, 2)))
-
-        def build_live_view():
-            return rich.console.Group(build_profile_panel(), build_group_tables())
-
-        def bracketed_spinner():
-            leading = " " * (count_width - 1)
-            spinner = rich.columns.Columns(
-                [rich.text.Text("  [ ", style="dim"), rich.text.Text(leading), rich.spinner.Spinner("dots", text="", style="green"), rich.text.Text(" ]  ", style="dim")],
-                expand=False,
-                equal=False,
-                padding=(0, 0))
-            return spinner
-
-        def bracketed_count(count):
-            text = rich.text.Text()
-            text.append("[ ", style="dim")
-            if str(count) == "Failed":
-                text.append(f"{count:>{count_width}}", style="red")
-            elif str(count) == "0":
-                text.append(f"{count:>{count_width}}", style="dim")
-            else:
-                text.append(f"{count:>{count_width}}")
-            text.append(" ]", style="dim")
-            return text
-
-        def run_with_status(label, count_key, func, *args, display_key=None, display_value=None, **kwargs):
-            group_rows = output_groups.setdefault(current_group, [])
-            display_label_value = display_value or self.artifacts_display.get(display_key, label)
-            display_label = display_label_value
-            group_rows.append((display_label, bracketed_spinner()))
-            live.update(build_live_view())
-            func(*args, **kwargs)
-            if display_key and display_value:
-                self.artifacts_display[display_key] = display_value
-            group_rows[-1] = (display_label, bracketed_count(self.artifacts_counts.get(count_key, "0")))
-            live.update(build_live_view())
-
-        with rich.live.Live(build_live_view(), console=console, refresh_per_second=4) as live:
+        with self.processing_display(group_order) as driver:
             # User Activity
-            current_group = "User Activity"
+            driver.group("User Activity")
             if 'History' in input_listing:
-                run_with_status(
+                driver.run(
                     'URL', 'History', self.get_history,
                     self.profile_path, 'History', self.version, 'url',
                     display_key='History', display_value=f'URL records')
 
-                run_with_status(
+                driver.run(
                     'Download', 'History_downloads', self.get_downloads,
                     self.profile_path, 'History', self.version, 'download',
                     display_key='History_downloads', display_value=f'Download records')
 
             if 'shared_proto_db' in input_listing:
-                run_with_status(
+                driver.run(
                     'Downloads (shared_proto_db)', 'shared_proto_db downloads',
                     self.get_shared_proto_db_downloads, self.profile_path, 'shared_proto_db',
                     display_key='shared_proto_db downloads',
                     display_value='shared_proto_db download records')
 
             if 'Archived History' in input_listing:
-                run_with_status(
+                driver.run(
                     'Archived History', 'Archived History', self.get_history,
                     self.profile_path, 'Archived History', self.version, 'url (archived)',
                     display_key='Archived History', display_value='Archived URL records')
 
             if 'Media History' in input_listing:
-                run_with_status(
+                driver.run(
                     'Media History', 'Media History', self.get_media_history,
                     self.profile_path, 'Media History', self.version, 'media (playback end)',
                     display_key='Media History', display_value='Media History records')
 
             if 'Web Data' in input_listing:
-                run_with_status(
+                driver.run(
                     'Autofill', 'Autofill', self.get_autofill,
                     self.profile_path, 'Web Data', self.version,
                     display_key='Autofill', display_value='Autofill records')
 
             if 'Login Data' in input_listing:
-                run_with_status(
+                driver.run(
                     'Login Data', 'Login Data', self.get_login_data,
                     self.profile_path, 'Login Data', self.version,
                     display_key='Login Data', display_value='Login Data records')
 
             if 'Login Data For Account' in input_listing:
-                run_with_status(
+                driver.run(
                     'Login Data', 'Login Data', self.get_login_data,
                     self.profile_path, 'Login Data For Account', self.version,
                     display_key='Login Data', display_value='Login Data (Account) records')
 
             if 'Bookmarks' in input_listing:
-                run_with_status(
+                driver.run(
                     'Bookmarks', 'Bookmarks', self.get_bookmarks,
                     self.profile_path, 'Bookmarks', self.version,
                     display_key='Bookmarks', display_value='Bookmark records')
 
             if 'Sessions' in input_listing:
-                run_with_status(
+                driver.run(
                     'Sessions', 'Sessions', self.get_sessions,
                     self.profile_path, 'Sessions',
                     display_key='Sessions', display_value='Session (SNSS) records')
 
             # Website Storage
-            current_group = "Website Storage"
+            driver.group("Website Storage")
             if network_listing and 'Cookies' in network_listing:
-                run_with_status(
+                driver.run(
                     'Network Cookies', 'Cookies', self.get_cookies,
                     os.path.join(self.profile_path, 'Network'), 'Cookies', self.version,
                     display_key='Cookies', display_value='Cookie records')
 
             elif 'Cookies' in input_listing:
-                run_with_status(
+                driver.run(
                     'Cookies', 'Cookies', self.get_cookies,
                     self.profile_path, 'Cookies', self.version,
                     display_key='Cookies', display_value='Cookie records')
 
             if self.cache_path is not None and self.cache_path != '':
                 c_path, c_dir = os.path.split(self.cache_path)
-                run_with_status(
+                driver.run(
                     'Cache', 'Cache', self.get_cache,
                     c_path, c_dir, row_type='cache',
                     display_key='Cache', display_value='Cache records')
 
             elif 'Cache' in input_listing:
                 if os.path.isdir(os.path.join(self.profile_path, 'Cache', 'Cache_Data')):
-                    run_with_status(
+                    driver.run(
                         'Cache', 'Cache', self.get_cache,
                         os.path.join(self.profile_path, 'Cache'), 'Cache_Data', row_type='cache',
                         display_key='Cache', display_value='Cache records')
                 else:
-                    run_with_status(
+                    driver.run(
                         'Cache', 'Cache', self.get_cache,
                         self.profile_path, 'Cache', row_type='cache',
                         display_key='Cache', display_value='Cache records')
@@ -4819,58 +4735,58 @@ class Chrome(WebBrowser):
                                             ('DawnCache', 'dawn'), ('DawnWebGPUCache', 'dawn webgpu'),
                                             ('DawnGraphiteCache', 'dawn graphite')]:
                 if cache_dir in input_listing:
-                    run_with_status(
+                    driver.run(
                         cache_dir, cache_dir, self.get_cache,
                         self.profile_path, cache_dir, row_type=f'cache ({cache_type})',
                         display_key=cache_dir, display_value=f'{cache_dir} records')
 
             if 'Local Storage' in input_listing:
-                run_with_status(
+                driver.run(
                     'Local Storage', 'Local Storage', self.get_local_storage,
                     self.profile_path, 'Local Storage',
                     display_key='Local Storage', display_value='Local Storage records')
 
             if 'Session Storage' in input_listing:
-                run_with_status(
+                driver.run(
                     'Session Storage', 'Session Storage', self.get_session_storage,
                     self.profile_path, 'Session Storage',
                     display_key='Session Storage', display_value='Session Storage records')
 
             if 'IndexedDB' in input_listing:
-                run_with_status(
+                driver.run(
                     'IndexedDB', 'IndexedDB', self.get_indexeddb,
                     self.profile_path, 'IndexedDB',
                     display_key='IndexedDB', display_value='IndexedDB records')
 
             if 'File System' in input_listing:
-                run_with_status(
+                driver.run(
                     'File System', 'File System', self.get_file_system,
                     self.profile_path, 'File System',
                     display_key='File System', display_value='File System items')
 
             if 'Platform Notifications' in input_listing:
-                run_with_status(
+                driver.run(
                     'Platform Notifications', 'Platform Notifications', self.get_platform_notifications,
                     self.profile_path, 'Platform Notifications',
                     display_key='Platform Notifications', display_value='Platform Notification records')
 
             if 'Service Worker' in input_listing:
-                run_with_status(
+                driver.run(
                     'Service Workers', 'Service Workers', self.get_service_workers,
                     self.profile_path, 'Service Worker',
                     display_key='Service Workers', display_value='Service Worker registrations')
 
             # Browser Extensions
-            current_group = "Browser Extensions"
+            driver.group("Browser Extensions")
 
             if 'Extensions' in input_listing:
-                run_with_status(
+                driver.run(
                     'Extensions', 'Extensions', self.get_extensions,
                     self.profile_path, 'Extensions',
                     display_key='Extensions', display_value='Installed Extensions')
 
             if 'Secure Preferences' in input_listing:
-                run_with_status(
+                driver.run(
                     'Extension Settings', 'Secure Preferences', self.get_extension_settings,
                     self.profile_path, 'Secure Preferences',
                     display_key='Extension Settings', display_value='Extension settings entries')
@@ -4884,14 +4800,14 @@ class Chrome(WebBrowser):
                 # if min(self.version) > 65:
                 #     ext_cookies_version.insert(0, 65)
 
-                run_with_status(
+                driver.run(
                     'Extension Cookies', 'Extension Cookies', self.get_cookies,
                     self.profile_path, 'Extension Cookies', ext_cookies_version,
                     display_key='Extension Cookies', display_value='Extension Cookie records')
 
             for directory in ['Extension Rules', 'Extension Scripts', 'Extension State']:
                 if directory in input_listing:
-                    run_with_status(
+                    driver.run(
                         directory, directory, self.get_unified_extension_data,
                         self.profile_path, directory,
                         display_key=f'{directory}', display_value=f'{directory} records')
@@ -4899,51 +4815,51 @@ class Chrome(WebBrowser):
             for directory in ['Local App Settings', 'Local Extension Settings',
                               'Managed Extension Settings', 'Sync App Settings', 'Sync Extension Settings']:
                 if directory in input_listing:
-                    run_with_status(
+                    driver.run(
                         directory, directory, self.get_partitioned_extension_data,
                         self.profile_path, directory,
                         display_key=f'{directory}', display_value=f'{directory} records')
 
             # Configuration & Supporting Data
-            current_group = "Configuration & Supporting Data"
+            driver.group("Configuration & Supporting Data")
 
             if 'Preferences' in input_listing:
-                run_with_status(
+                driver.run(
                     'Preferences', 'Preferences', self.get_preferences,
                     self.profile_path, 'Preferences',
                     display_key='Preferences', display_value='Preference items')
 
             if 'Site Characteristics Database' in input_listing:
-                run_with_status(
+                driver.run(
                     'Site Characteristics', 'Site Characteristics', self.get_site_characteristics,
                     self.profile_path, 'Site Characteristics Database',
                     display_key='Site Characteristics', display_value='Site Characteristics records')
 
             if 'Sync Data' in input_listing:
-                run_with_status(
+                driver.run(
                     'Sync Data', 'Sync Data', self.get_sync_data,
                     self.profile_path, 'Sync Data',
                     display_key='Sync Data', display_value='Sync Data records')
 
             if network_listing and 'TransportSecurity' in network_listing:
-                run_with_status(
+                driver.run(
                     'Network HSTS', 'HSTS', self.get_transport_security,
                     os.path.join(self.profile_path, 'Network'), 'TransportSecurity',
                     display_key='HSTS', display_value='HSTS records')
 
             elif 'TransportSecurity' in input_listing:
-                run_with_status(
+                driver.run(
                     'HSTS', 'HSTS', self.get_transport_security,
                     self.profile_path, 'TransportSecurity',
                     display_key='HSTS', display_value='HSTS records')
 
             if 'DIPS' in input_listing:
-                run_with_status(
+                driver.run(
                     'DIPS Popups', 'DIPS Popups', self.get_dips_popups,
                     self.profile_path, 'DIPS', self.version,
                     display_key='DIPS Popups', display_value='DIPS Popup records')
 
-                run_with_status(
+                driver.run(
                     'DIPS', 'DIPS', self.get_dips,
                     self.profile_path, 'DIPS', self.version,
                     display_key='DIPS', display_value='DIPS records')
