@@ -87,11 +87,18 @@ h1 {
     border-left: 1px solid #444444;
     border-right: 1px solid #444444;
     border-bottom: 1px solid #444444;
-    width: 1220px;
+    width: 1290px;
     display: inline-block;
     background-color: #ffffff;
     margin: 0px;
     padding: 10px;
+}
+
+/* Long profile paths (e.g. deep AppData paths) must wrap inside the Summary box
+   instead of forcing the column wider. */
+.results-options-container li {
+    overflow-wrap: anywhere;
+    word-break: break-word;
 }
 
 .h-logo-cell {
@@ -129,7 +136,7 @@ h1 {
 }
 
 .results-artifacts-container {
-    width: 348px;
+    width: 400px;
     padding: 0px;
     margin: 0px;
     border: 0px;
@@ -165,7 +172,7 @@ h1 {
 
 .results-row {
     line-height: 1.2;
-    padding-right: 50px;
+    padding-right: 12px;
 }
 
 .header-box {

@@ -28,7 +28,7 @@ curl -sSL https://raw.githubusercontent.com/obsidianforensics/hindsight/master/i
 
 ## Command Line
 
-There also is command line version of Hindsight - hindsight.py or hindsight.exe. The user guide in the documentation folder covers many topics, but the info below should get you started with the command line version:
+There also is a command line version of Hindsight - hindsight.py or hindsight.exe. The user guide in the documentation folder covers many topics, but the info below should get you started with the command line version:
 
 Example usage:  \> C:\\hindsight.py -i "C:\Users\Ryan\AppData\Local\Google\Chrome\User Data\Default" -o test_case
 
