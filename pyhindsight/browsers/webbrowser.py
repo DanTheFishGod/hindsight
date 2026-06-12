@@ -4,9 +4,132 @@ import logging
 import sqlite3
 import sys
 import urllib.parse
+import rich.align
+import rich.columns
+import rich.console
+import rich.live
+import rich.panel
+import rich.spinner
+import rich.table
+import rich.text
 from pyhindsight import utils
 
 log = logging.getLogger(__name__)
+
+
+class ProcessingDisplay:
+    """Live, grouped progress table shared across browsers.
+
+    Obtained via ``WebBrowser.processing_display(group_order)`` and used as a
+    context manager. Each browser's ``process()`` owns its own file-presence
+    gating and group labels; this driver owns only the presentation (the
+    ``rich.live`` table, spinner, and bracketed counts). It reads browser state
+    (``artifacts_counts`` / ``artifacts_display`` / ``profile_path`` /
+    ``browser_name`` / ``display_version``) but holds no parser-specific logic.
+
+    Usage:
+        with self.processing_display(["Group A", "Group B"]) as driver:
+            driver.group("Group A")
+            driver.run('URL', 'History', self.get_history, path, 'History', ...,
+                       display_key='History', display_value='URL records')
+    """
+
+    count_width = 7
+    table_width = 50  # Consistent width for tables and panel
+
+    def __init__(self, browser, group_order):
+        self.browser = browser
+        self.group_order = list(group_order)
+        self.current_group = self.group_order[0] if self.group_order else 'Artifacts'
+        self.output_groups = {}
+        self.console = rich.console.Console()
+        self._live = None
+
+    def __enter__(self):
+        self._live = rich.live.Live(
+            self._build_live_view(), console=self.console, refresh_per_second=4)
+        self._live.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._live.__exit__(*exc_info)
+
+    def group(self, name):
+        """Set the group subsequent run() calls are bucketed under."""
+        self.current_group = name
+
+    def run(self, label, count_key, func, *args, display_key=None, display_value=None, **kwargs):
+        """Show a spinner row, run the parser, then replace it with its count."""
+        group_rows = self.output_groups.setdefault(self.current_group, [])
+        display_label = display_value or self.browser.artifacts_display.get(display_key, label)
+        group_rows.append((display_label, self._bracketed_spinner()))
+        self._live.update(self._build_live_view())
+        func(*args, **kwargs)
+        if display_key and display_value:
+            self.browser.artifacts_display[display_key] = display_value
+        group_rows[-1] = (
+            display_label, self._bracketed_count(self.browser.artifacts_counts.get(count_key, "0")))
+        self._live.update(self._build_live_view())
+
+    def _build_table(self, rows, header_label):
+        # Header row as separate table with center alignment
+        header = rich.table.Table(show_header=False, box=None, expand=False)
+        header.add_column(justify="left", width=self.table_width - self.count_width - 8, style="bold on #333333")
+        header.add_column(justify="center", width=self.count_width + 8, style="bold on #333333")
+        header.add_row(rich.text.Text(header_label, style="bold"), rich.text.Text("Count", style="bold"))
+
+        # Content table with right alignment
+        table = rich.table.Table(show_header=False, box=None, expand=False)
+        table.add_column(overflow="fold", justify="right", width=self.table_width - self.count_width - 8)
+        table.add_column(justify="center", width=self.count_width + 8, no_wrap=True)
+        for row_label, row_count in rows:
+            table.add_row(row_label, row_count)
+        return rich.console.Group(header, table)
+
+    def _build_group_tables(self):
+        tables = []
+        for group_name in self.group_order:
+            rows = self.output_groups.get(group_name, [])
+            if not rows:
+                continue
+            inner_table = self._build_table(rows, group_name)
+            tables.append(rich.align.Align.center(inner_table))
+            tables.append(rich.text.Text(""))  # Padding between groups
+        return rich.console.Group(*tables)
+
+    def _build_profile_panel(self):
+        # Use a table with min_width so panel can expand for long paths
+        content = rich.table.Table(show_header=False, box=None, expand=False)
+        content.add_column(min_width=self.table_width, overflow="fold")
+        content.add_row(f"Path: {self.browser.profile_path}")
+        content.add_row(f"Detected Browser: {self.browser.browser_name} v{self.browser.display_version}")
+        return rich.align.Align.center(
+            rich.panel.Panel(content, title="Profile", border_style="green", padding=(0, 2)))
+
+    def _build_live_view(self):
+        return rich.console.Group(self._build_profile_panel(), self._build_group_tables())
+
+    def _bracketed_spinner(self):
+        leading = " " * (self.count_width - 1)
+        spinner = rich.columns.Columns(
+            [rich.text.Text("  [ ", style="dim"), rich.text.Text(leading),
+             rich.spinner.Spinner("dots", text="", style="green"), rich.text.Text(" ]  ", style="dim")],
+            expand=False,
+            equal=False,
+            padding=(0, 0))
+        return spinner
+
+    def _bracketed_count(self, count):
+        text = rich.text.Text()
+        text.append("[ ", style="dim")
+        if str(count) == "Failed":
+            text.append(f"{count:>{self.count_width}}", style="red")
+        elif str(count) == "0":
+            text.append(f"{count:>{self.count_width}}", style="dim")
+        else:
+            text.append(f"{count:>{self.count_width}}")
+        text.append(" ]", style="dim")
+        return text
 
 
 class WebBrowser(object):
@@ -44,6 +167,16 @@ class WebBrowser(object):
             .format(name=name, left_width=int(left_side), count=' '.join(['[', count, ']']),
                     right_width=(width - int(left_side)-2))
         return pretty_name
+
+    def processing_display(self, group_order):
+        """Return a live, grouped progress display for use as a context manager.
+
+        ``group_order`` is this browser's own ordered list of group labels. The
+        browser's ``process()`` keeps full ownership of file-presence gating and
+        which parsers run; this only drives the shared presentation. See
+        ``ProcessingDisplay``.
+        """
+        return ProcessingDisplay(self, group_order)
 
     @staticmethod
     def format_profile_path(profile_path):

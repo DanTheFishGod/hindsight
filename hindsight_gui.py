@@ -308,6 +308,14 @@ def main():
         if os.path.isdir(potential_static_path):
             STATIC_PATH = potential_static_path
 
+    # SECURITY: bind to localhost only. Hindsight is a single-operator forensic
+    # tool — the profile/cache/log paths submitted via the GUI are treated as
+    # trusted because the operator runs the process at their own privilege and
+    # reads only files they could already access. That assumption holds ONLY
+    # while the server is loopback-bound. Do NOT change host to 0.0.0.0 (or
+    # otherwise expose it): combined with running at a higher privilege than the
+    # requester, it turns those operator-supplied paths into a genuine
+    # arbitrary-file-read (CWE-22). See dismissed code-scanning alert py/path-injection.
     bottle.run(host='localhost', port=8080, debug=True)
 
 

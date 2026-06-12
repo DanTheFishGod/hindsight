@@ -2727,123 +2727,142 @@ class Firefox(WebBrowser):
             log.error(f'Unable to read Firefox profile {self.profile_path}: {e}')
             return
 
+        # Detect the schema version up front so the live display's profile panel
+        # ("Detected Browser: Firefox v<schema>") is correct from the first frame.
         if 'places.sqlite' in input_listing:
             self.determine_version(self.profile_path, 'places.sqlite')
-            print((self.format_processing_output(
-                f'Detected {self.browser_name} schema', self.display_version or 'unknown')))
 
-            self.get_history(self.profile_path, 'places.sqlite')
-            self.artifacts_display['places.sqlite'] = 'URL records'
-            print((self.format_processing_output(
-                'URL records', self.artifacts_counts.get('places.sqlite', 0))))
+        # Firefox declares its own group labels; the shared driver (lifted to
+        # WebBrowser) owns only the presentation. File-presence gating stays here.
+        group_order = [
+            "User Activity",
+            "Website Storage",
+            "Browser Extensions",
+            "Configuration & Supporting Data",
+        ]
 
-            self.get_bookmarks(self.profile_path, 'places.sqlite')
-            self.artifacts_display['Bookmarks'] = 'Bookmark records'
-            print((self.format_processing_output(
-                'Bookmark records', self.artifacts_counts.get('Bookmarks', 0))))
+        with self.processing_display(group_order) as driver:
+            # User Activity
+            driver.group("User Activity")
+            if 'places.sqlite' in input_listing:
+                driver.run(
+                    'URL records', 'places.sqlite', self.get_history,
+                    self.profile_path, 'places.sqlite',
+                    display_key='places.sqlite', display_value='URL records')
 
-            self.get_downloads(self.profile_path, 'places.sqlite')
-            self.artifacts_display['places.sqlite_downloads'] = 'Download records'
-            print((self.format_processing_output(
-                'Download records', self.artifacts_counts.get('places.sqlite_downloads', 0))))
+                driver.run(
+                    'Download records', 'places.sqlite_downloads', self.get_downloads,
+                    self.profile_path, 'places.sqlite',
+                    display_key='places.sqlite_downloads', display_value='Download records')
 
-        if 'cookies.sqlite' in input_listing:
-            self.get_cookies(self.profile_path, 'cookies.sqlite')
-            self.artifacts_display['Cookies'] = 'Cookie records'
-            print((self.format_processing_output(
-                'Cookie records', self.artifacts_counts.get('Cookies', 0))))
+                driver.run(
+                    'Bookmark records', 'Bookmarks', self.get_bookmarks,
+                    self.profile_path, 'places.sqlite',
+                    display_key='Bookmarks', display_value='Bookmark records')
 
-        if 'formhistory.sqlite' in input_listing:
-            self.get_form_history(self.profile_path, 'formhistory.sqlite')
-            print((self.format_processing_output(
-                'Form history records', self.artifacts_counts.get('formhistory.sqlite', 0))))
+            if 'formhistory.sqlite' in input_listing:
+                driver.run(
+                    'Form history records', 'formhistory.sqlite', self.get_form_history,
+                    self.profile_path, 'formhistory.sqlite',
+                    display_key='formhistory.sqlite', display_value='Form history records')
 
-        if 'prefs.js' in input_listing:
-            self.get_preferences(self.profile_path, 'prefs.js')
-            self.artifacts_display['Preferences'] = 'Preference items'
-            print((self.format_processing_output(
-                'Preference items', self.artifacts_counts.get('Preferences', 0))))
+            if 'sessionstore.jsonlz4' in input_listing or 'sessionstore-backups' in input_listing:
+                driver.run(
+                    'Session (tab) records', 'Sessions', self.get_sessionstore,
+                    self.profile_path,
+                    display_key='Sessions', display_value='Session (tab) records')
 
-        if 'permissions.sqlite' in input_listing:
-            self.get_permissions(self.profile_path, 'permissions.sqlite')
-            self.artifacts_display['Permissions'] = 'Permission records'
-            print((self.format_processing_output(
-                'Permission records', self.artifacts_counts.get('Permissions', 0))))
+            if 'bookmarkbackups' in input_listing:
+                driver.run(
+                    'Bookmark backup records', 'Bookmark Backups', self.get_bookmark_backups,
+                    self.profile_path,
+                    display_key='Bookmark Backups', display_value='Bookmark backup records')
 
-        if 'SiteSecurityServiceState.bin' in input_listing:
-            self.get_hsts(self.profile_path, 'SiteSecurityServiceState.bin')
-            self.artifacts_display['HSTS'] = 'HSTS records'
-            print((self.format_processing_output(
-                'HSTS records', self.artifacts_counts.get('HSTS', 0))))
+            if 'favicons.sqlite' in input_listing:
+                driver.run(
+                    'Favicon-derived URL records', 'Favicons', self.get_favicons,
+                    self.profile_path, 'favicons.sqlite',
+                    display_key='Favicons', display_value='Favicon-derived URL records')
 
-        if 'logins.json' in input_listing:
-            self.get_logins(self.profile_path, 'logins.json')
-            self.artifacts_display['Logins'] = 'Saved login records'
-            print((self.format_processing_output(
-                'Saved login records', self.artifacts_counts.get('Logins', 0))))
+            # Website Storage
+            driver.group("Website Storage")
+            if 'cookies.sqlite' in input_listing:
+                driver.run(
+                    'Cookie records', 'Cookies', self.get_cookies,
+                    self.profile_path, 'cookies.sqlite',
+                    display_key='Cookies', display_value='Cookie records')
 
-        if 'extensions.json' in input_listing:
-            self.get_extensions(self.profile_path, 'extensions.json')
-            self.artifacts_display['Extensions'] = 'Installed Extensions'
-            print((self.format_processing_output(
-                'Installed Extensions', self.artifacts_counts.get('Extensions', 0))))
+            if 'storage' in input_listing and os.path.isdir(
+                    os.path.join(self.profile_path, 'storage', 'default')):
+                driver.run(
+                    'Local Storage records', 'Local Storage', self.get_local_storage,
+                    self.profile_path,
+                    display_key='Local Storage', display_value='Local Storage records')
 
-        if 'sessionstore.jsonlz4' in input_listing or 'sessionstore-backups' in input_listing:
-            self.get_sessionstore(self.profile_path)
-            self.artifacts_display['Sessions'] = 'Session (tab) records'
-            print((self.format_processing_output(
-                'Session (tab) records', self.artifacts_counts.get('Sessions', 0))))
+                driver.run(
+                    'IndexedDB records', 'IndexedDB', self.get_indexeddb,
+                    self.profile_path,
+                    display_key='IndexedDB', display_value='IndexedDB records')
 
-        if 'bookmarkbackups' in input_listing:
-            self.get_bookmark_backups(self.profile_path)
-            self.artifacts_display['Bookmark Backups'] = 'Bookmark backup records'
-            print((self.format_processing_output(
-                'Bookmark backup records', self.artifacts_counts.get('Bookmark Backups', 0))))
+                driver.run(
+                    'Cache API records', 'Cache API', self.get_cache_storage,
+                    self.profile_path,
+                    display_key='Cache API', display_value='Cache API records')
 
-        if 'favicons.sqlite' in input_listing:
-            self.get_favicons(self.profile_path, 'favicons.sqlite')
-            self.artifacts_display['Favicons'] = 'Favicon-derived URL records'
-            print((self.format_processing_output(
-                'Favicon-derived URL records', self.artifacts_counts.get('Favicons', 0))))
+            cache_dir = self._resolve_cache_dir()
+            if cache_dir:
+                driver.run(
+                    'Cache records', 'Cache', self.get_cache,
+                    cache_dir,
+                    display_key='Cache', display_value='Cache records')
+            else:
+                log.info('No Firefox cache2 directory found; skipping cache parse.')
 
-        if 'bounce-tracking-protection.sqlite' in input_listing:
-            self.get_bounce_tracking(self.profile_path, 'bounce-tracking-protection.sqlite')
-            self.artifacts_display['Bounce Tracking'] = 'Bounce-tracking records'
-            print((self.format_processing_output(
-                'Bounce-tracking records', self.artifacts_counts.get('Bounce Tracking', 0))))
+            # Browser Extensions
+            driver.group("Browser Extensions")
+            if 'extensions.json' in input_listing:
+                driver.run(
+                    'Installed Extensions', 'Extensions', self.get_extensions,
+                    self.profile_path, 'extensions.json',
+                    display_key='Extensions', display_value='Installed Extensions')
 
-        if 'protections.sqlite' in input_listing:
-            self.get_content_blocking(self.profile_path, 'protections.sqlite')
-            self.artifacts_display['Content Blocking'] = 'Content-blocking event records'
-            print((self.format_processing_output(
-                'Content-blocking event records',
-                self.artifacts_counts.get('Content Blocking', 0))))
+            # Configuration & Supporting Data
+            driver.group("Configuration & Supporting Data")
+            if 'prefs.js' in input_listing:
+                driver.run(
+                    'Preference items', 'Preferences', self.get_preferences,
+                    self.profile_path, 'prefs.js',
+                    display_key='Preferences', display_value='Preference items')
 
-        if 'storage' in input_listing and os.path.isdir(
-                os.path.join(self.profile_path, 'storage', 'default')):
-            self.get_local_storage(self.profile_path)
-            self.artifacts_display['Local Storage'] = 'Local Storage records'
-            print((self.format_processing_output(
-                'Local Storage records', self.artifacts_counts.get('Local Storage', 0))))
+            if 'permissions.sqlite' in input_listing:
+                driver.run(
+                    'Permission records', 'Permissions', self.get_permissions,
+                    self.profile_path, 'permissions.sqlite',
+                    display_key='Permissions', display_value='Permission records')
 
-            self.get_indexeddb(self.profile_path)
-            self.artifacts_display['IndexedDB'] = 'IndexedDB records'
-            print((self.format_processing_output(
-                'IndexedDB records', self.artifacts_counts.get('IndexedDB', 0))))
+            if 'SiteSecurityServiceState.bin' in input_listing:
+                driver.run(
+                    'HSTS records', 'HSTS', self.get_hsts,
+                    self.profile_path, 'SiteSecurityServiceState.bin',
+                    display_key='HSTS', display_value='HSTS records')
 
-            self.get_cache_storage(self.profile_path)
-            self.artifacts_display['Cache API'] = 'Cache API records'
-            print((self.format_processing_output(
-                'Cache API records', self.artifacts_counts.get('Cache API', 0))))
+            if 'logins.json' in input_listing:
+                driver.run(
+                    'Saved login records', 'Logins', self.get_logins,
+                    self.profile_path, 'logins.json',
+                    display_key='Logins', display_value='Saved login records')
 
-        cache_dir = self._resolve_cache_dir()
-        if cache_dir:
-            self.get_cache(cache_dir)
-            self.artifacts_display['Cache'] = 'Cache records'
-            print((self.format_processing_output(
-                'Cache records', self.artifacts_counts.get('Cache', 0))))
-        else:
-            log.info('No Firefox cache2 directory found; skipping cache parse.')
+            if 'bounce-tracking-protection.sqlite' in input_listing:
+                driver.run(
+                    'Bounce-tracking records', 'Bounce Tracking', self.get_bounce_tracking,
+                    self.profile_path, 'bounce-tracking-protection.sqlite',
+                    display_key='Bounce Tracking', display_value='Bounce-tracking records')
+
+            if 'protections.sqlite' in input_listing:
+                driver.run(
+                    'Content-blocking event records', 'Content Blocking', self.get_content_blocking,
+                    self.profile_path, 'protections.sqlite',
+                    display_key='Content Blocking', display_value='Content-blocking event records')
 
         self.parsed_artifacts.sort()
 
