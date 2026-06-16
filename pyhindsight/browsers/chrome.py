@@ -48,7 +48,9 @@ class Chrome(WebBrowser):
             self, profile_path, browser_name=browser_name, cache_path=cache_path, version=version, timezone=timezone,
             no_copy=no_copy, temp_dir=temp_dir)
         self.profile_path = profile_path
-        self.browser_name = "Chrome"
+        # Honor a variant passed by the caller (e.g. "Edge", "Brave", "Vivaldi");
+        # all Chromium variants currently share this parser and differ only in variant.
+        self.browser_name = browser_name or "Chrome"
         self.cache_path = cache_path
         self.timezone = timezone
         self.installed_extensions = {}
@@ -1831,10 +1833,20 @@ class Chrome(WebBrowser):
 
         ss_ldb_records = None
 
+        # The bundled ccl_chromium_sessionstorage overwrites its module-level `log`
+        # with None, so its own `log.warning(...)` calls (e.g. when a record fails to
+        # UTF-16-LE decode) raise AttributeError and abort the whole run instead of
+        # skipping the bad record. Hand it a real logger so it degrades gracefully.
+        if ccl_chromium_reader.ccl_chromium_sessionstorage.log is None:
+            ccl_chromium_reader.ccl_chromium_sessionstorage.log = \
+                logging.getLogger('ccl_chromium_reader.ccl_chromium_sessionstorage')
+
         try:
             ss_ldb_records = ccl_chromium_reader.ccl_chromium_sessionstorage.SessionStoreDb(pathlib.Path(ss_path))
-        except ValueError as e:
-            log.warning(f' - Error reading records ({e}); possible LevelDB corruption')
+        except Exception as e:
+            # The reader raises a range of errors on corrupt/truncated LevelDB data;
+            # a single bad Session Storage shouldn't abort a multi-profile analysis.
+            log.warning(f' - Error reading records ({e!r}); possible LevelDB corruption')
             self.artifacts_counts['Session Storage'] = 'Failed'
 
         if ss_ldb_records:

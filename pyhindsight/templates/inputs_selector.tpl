@@ -55,7 +55,11 @@
                                     <select name="browser_type" onchange="toggle(this.value)">
                                         <option value="">Auto-detect</option>
                                         <option value="Chrome">Chrome</option>
+                                        <option value="Edge">Edge</option>
+                                        <option value="Brave">Brave</option>
+                                        <option value="Vivaldi">Vivaldi</option>
                                         <option value="Firefox">Firefox</option>
+                                        <option value="Tor">Tor</option>
                                     </select>
                                 </td>
                                 <td style="text-align: right;">

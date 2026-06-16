@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import struct
 import urllib.parse
 
@@ -134,7 +135,9 @@ class Firefox(WebBrowser):
             self, profile_path, browser_name=browser_name, cache_path=cache_path, version=version,
             timezone=timezone, no_copy=no_copy, temp_dir=temp_dir)
         self.profile_path = profile_path
-        self.browser_name = "Firefox"
+        # Honor a variant passed by the caller (e.g. "Tor"); Tor Browser is
+        # Firefox-based and currently shares this parser, differing only in variant.
+        self.browser_name = browser_name or "Firefox"
         self.cache_path = cache_path
         self.timezone = timezone
         self.no_copy = no_copy
@@ -178,6 +181,27 @@ class Firefox(WebBrowser):
         finally:
             conn.close()
 
+    def _execute_versioned_query(self, cursor, queries, artifact_name):
+        """Execute the schema-appropriate query from a {min_schema_version: sql} dict.
+
+        Mirrors the Chrome parser's approach: pick the query for the detected
+        places schema version (``self.version``, from PRAGMA user_version), then
+        fall back to lower-schema queries if the chosen one references a column
+        the profile doesn't have yet (sqlite3.OperationalError). Returns True if
+        a query executed (the cursor then holds the rows), False otherwise.
+        """
+        schema_version = self.version[0] if self.version else max(queries)
+        candidates = sorted((v for v in queries if v <= schema_version), reverse=True) or [min(queries)]
+        for candidate in candidates:
+            try:
+                cursor.execute(queries[candidate])
+                log.info(f' - Using {artifact_name} query for places schema v{candidate}')
+                return True
+            except sqlite3.OperationalError as e:
+                log.warning(f' - {artifact_name} query for places schema v{candidate} '
+                            f'failed ({e}); trying an older schema')
+        return False
+
     def get_history(self, path, database='places.sqlite', row_type='url'):
         results = []
         log.info(f'History items from {database}:')
@@ -186,11 +210,17 @@ class Firefox(WebBrowser):
         if not conn:
             return
 
-        try:
-            cursor = conn.cursor()
-            # `hidden` rows are framed/redirect-only entries the user didn't navigate to;
-            # keep them so examiners can filter in the output rather than us deciding.
-            query = (
+        # `description` and `preview_image_url` were added to moz_places in
+        # MigrateV38Up (places schema v38 / Firefox 57). Profiles below that — e.g.
+        # older Tor Browser builds, which sit at places schema v30 — lack both
+        # columns, so a single query referencing them fails the whole history read.
+        # Keep one readable query per schema era (keyed by the minimum places
+        # user_version it applies to); `hidden` rows are framed/redirect-only
+        # entries the user didn't navigate to — keep them so examiners can filter
+        # in the output rather than us deciding.
+        queries = {
+            # places schema v38+ (Firefox 57+): has description / preview_image_url.
+            38: (
                 "SELECT p.id AS place_id, p.url, p.title, p.visit_count, "
                 "       p.typed, p.hidden, p.last_visit_date, p.frecency, "
                 "       p.description, p.preview_image_url, "
@@ -201,11 +231,26 @@ class Firefox(WebBrowser):
                 "                      WHERE id = v.from_visit)) AS from_url "
                 "FROM moz_places p "
                 "JOIN moz_historyvisits v ON p.id = v.place_id"
-            )
-            try:
-                cursor.execute(query)
-            except Exception as e:
-                log.error(f' - Could not query history: {e}')
+            ),
+            # Pre-v38 schema (e.g. Tor Browser's places schema v30): no
+            # description / preview_image_url columns.
+            1: (
+                "SELECT p.id AS place_id, p.url, p.title, p.visit_count, "
+                "       p.typed, p.hidden, p.last_visit_date, p.frecency, "
+                "       v.id AS visit_id, v.visit_date, v.visit_type, "
+                "       v.from_visit, v.session, "
+                "       (SELECT url FROM moz_places "
+                "         WHERE id = (SELECT place_id FROM moz_historyvisits "
+                "                      WHERE id = v.from_visit)) AS from_url "
+                "FROM moz_places p "
+                "JOIN moz_historyvisits v ON p.id = v.place_id"
+            ),
+        }
+
+        try:
+            cursor = conn.cursor()
+            if not self._execute_versioned_query(cursor, queries, 'history'):
+                log.error(' - Could not query history with any known schema')
                 self.artifacts_counts[database] = 'Failed'
                 return
 
