@@ -598,26 +598,47 @@ class AnalysisSession(object):
         else:
             setattr(self, item_name, item_value)
 
-    # Canonical browser families a profile can be detected/dispatched as. Chromium
-    # variants (Edge, Brave, etc.) share the "Chrome" pipeline for now and are
-    # distinguished only by branding, not by which files are present.
+    # Variants a profile can be detected/dispatched as. `is_profile()` detects the
+    # engine family ('Chrome' for Chromium, 'Firefox'); `detect_browser_variant()`
+    # then refines that into a specific variant below. Chromium variants share the
+    # Chrome parser and Tor shares the Firefox parser — they differ only in
+    # variant, not in which files are present or how they're parsed.
+    FIREFOX_VARIANTS = {'Firefox', 'Tor'}
+
+    # A unique top-level key in a Chromium profile's `Preferences` JSON identifies
+    # the variant. Plain Chrome/Chromium has none of these.
+    CHROMIUM_VARIANT_PREFS_KEYS = (
+        ('edge', 'Edge'),
+        ('brave', 'Brave'),
+        ('vivaldi', 'Vivaldi'),
+    )
+
+    # Substrings in a Firefox profile's `prefs.js` that mark a Tor Browser profile.
+    TOR_PREFS_MARKERS = ('torbrowser.', 'extensions.torbutton', 'extensions.torlauncher')
+
+    # `-b/--browser_type` override values (case-insensitive) -> variant. Chromium
+    # itself maps to 'Chrome' since the two are indistinguishable in this dataset.
     BROWSER_TYPE_ALIASES = {
         'chrome': 'Chrome',
         'chromium': 'Chrome',
-        'edge': 'Chrome',
-        'firefox': 'Firefox',
+        'edge': 'Edge',
         'brave': 'Brave',
+        'vivaldi': 'Vivaldi',
+        'firefox': 'Firefox',
+        'tor': 'Tor',
     }
 
     @staticmethod
     def is_profile(base_path, existing_files, warn=False):
-        """Return the detected browser family for `base_path`, or None.
+        """Return the detected browser engine family for `base_path`, or None.
 
         A Chromium profile (Chrome/Edge/Brave/...) has a ``History`` SQLite file;
-        a Firefox profile has ``places.sqlite``. Returns the canonical family name
-        ('Chrome' or 'Firefox') so callers can dispatch per profile, or None if
-        neither marker is present. The return value is truthy for a recognized
-        profile and falsy otherwise, so existing boolean callers keep working.
+        a Firefox profile (Firefox/Tor) has ``places.sqlite``. Returns the engine
+        family name ('Chrome' or 'Firefox') so callers can dispatch per profile,
+        or None if neither marker is present. Variant (Chrome vs Edge vs Brave, or
+        Firefox vs Tor) is a separate refinement — see ``detect_browser_variant``.
+        The return value is truthy for a recognized profile and falsy otherwise,
+        so existing boolean callers keep working.
         """
         for required_file, family in (('History', 'Chrome'), ('places.sqlite', 'Firefox')):
             if required_file in existing_files and os.path.isfile(os.path.join(base_path, required_file)):
@@ -627,6 +648,69 @@ class AnalysisSession(object):
             log.warning(f"The profile directory {base_path} does not contain a recognized "
                         f"browser history file (History or places.sqlite). Analysis may not be very useful.")
         return None
+
+    @classmethod
+    def detect_browser_variant(cls, base_path, existing_files, family):
+        """Refine an engine `family` from `is_profile()` into a specific variant.
+
+        Chromium variants are told apart by a unique top-level key in the
+        profile's ``Preferences`` JSON (e.g. Edge -> ``edge``, Brave -> ``brave``);
+        Tor is told apart from Firefox by Tor-specific keys in ``prefs.js``. These
+        files sit alongside the history marker and travel with a copied profile,
+        so detection works even when the original directory path is gone. Falls
+        back to the plain variant ('Chrome'/'Firefox') when no marker is found —
+        plain Chromium has no distinguishing key, so it stays 'Chrome'.
+        """
+        if family == 'Chrome':
+            if 'Preferences' in existing_files:
+                prefs = cls._load_json(os.path.join(base_path, 'Preferences'))
+                if isinstance(prefs, dict):
+                    for key, variant in cls.CHROMIUM_VARIANT_PREFS_KEYS:
+                        if key in prefs:
+                            return variant
+            return 'Chrome'
+
+        if family == 'Firefox':
+            if 'prefs.js' in existing_files:
+                try:
+                    with open(os.path.join(base_path, 'prefs.js'), encoding='utf-8', errors='replace') as f:
+                        prefs_text = f.read()
+                    if any(marker in prefs_text for marker in cls.TOR_PREFS_MARKERS):
+                        return 'Tor'
+                except OSError as e:
+                    log.warning(f'Unable to read prefs.js in {base_path}; Exception: {e}')
+            return 'Firefox'
+
+        return family
+
+    @staticmethod
+    def _load_json(path):
+        """Load a JSON file, returning None on any read/parse error."""
+        try:
+            with open(path, encoding='utf-8') as f:
+                return json.load(f)
+        except (OSError, ValueError) as e:
+            log.warning(f'Unable to read JSON file {path}; Exception: {e}')
+            return None
+
+    def _resolve_pipeline(self, variant, profile_path):
+        """Map a variant to the parser pipeline that should process it.
+
+        Chromium variants use the Chrome parser; Firefox/Tor use the Firefox
+        parser. 'Brave' is the one ambiguous case: modern Brave is Chromium and
+        parses via Chrome (it has a SQLite ``History``), while legacy Muon-era
+        Brave stored history in ``session-store-*`` JSON and needs the dedicated
+        Brave parser. Decide by what's on disk rather than by the label.
+        """
+        if variant in self.FIREFOX_VARIANTS:
+            return 'firefox'
+        if variant == 'Brave':
+            try:
+                has_history = os.path.isfile(os.path.join(profile_path, 'History'))
+            except OSError:
+                has_history = False
+            return 'chrome' if has_history else 'brave_legacy'
+        return 'chrome'
 
     def search_subdirs(self, base_path):
         """Recursively search a path for browser profiles"""
@@ -641,7 +725,8 @@ class AnalysisSession(object):
         family = self.is_profile(base_path, base_dir_listing)
         if family:
             found_profile_paths.append(base_path)
-            self.detected_profile_families[base_path] = family
+            self.detected_profile_families[base_path] = \
+                self.detect_browser_variant(base_path, base_dir_listing, family)
         for item in base_dir_listing:
             item_path = os.path.join(base_path, item)
             if os.path.isdir(item_path) and not os.path.islink(item_path):
@@ -668,7 +753,8 @@ class AnalysisSession(object):
         family = self.is_profile(base_path, base_dir_listing, warn=True)
         if family:
             found_profile_paths.append(base_path)
-            self.detected_profile_families[base_path] = family
+            self.detected_profile_families[base_path] = \
+                self.detect_browser_variant(base_path, base_dir_listing, family)
 
         else:
             # Only search sub dirs if the current dir is not a Profile (Profiles are not nested).
@@ -753,10 +839,12 @@ class AnalysisSession(object):
                 self.browser_type
                 or self.detected_profile_families.get(found_profile_path)
                 or "Chrome")
+            pipeline = self._resolve_pipeline(profile_browser_type, found_profile_path)
             log.info(f' - Parsing profile {found_profile_path} as {profile_browser_type}')
 
-            if profile_browser_type == "Chrome":
-                browser_analysis = Chrome(found_profile_path, available_decrypts=self.available_decrypts,
+            if pipeline == "chrome":
+                browser_analysis = Chrome(found_profile_path, browser_name=profile_browser_type,
+                                          available_decrypts=self.available_decrypts,
                                           cache_path=self.cache_path, timezone=self.timezone,
                                           no_copy=self.no_copy, temp_dir=self.temp_dir,
                                           originator_guids=self.originator_guids)
@@ -800,8 +888,9 @@ class AnalysisSession(object):
                         except Exception as e:
                             log.info(f'Exception occurred while analyzing {item} for analysis session promotion: {e}')
 
-            elif profile_browser_type == "Firefox":
-                browser_analysis = Firefox(found_profile_path, cache_path=self.cache_path,
+            elif pipeline == "firefox":
+                browser_analysis = Firefox(found_profile_path, browser_name=profile_browser_type,
+                                           cache_path=self.cache_path,
                                            timezone=self.timezone,
                                            no_copy=self.no_copy, temp_dir=self.temp_dir)
                 browser_analysis.process()
@@ -824,7 +913,7 @@ class AnalysisSession(object):
                         except Exception as e:
                             log.info(f'Exception occurred while analyzing {item} for analysis session promotion: {e}')
 
-            elif profile_browser_type == "Brave":
+            elif pipeline == "brave_legacy":
                 browser_analysis = Brave(found_profile_path, timezone=self.timezone)
                 browser_analysis.process()
                 self.parsed_artifacts = browser_analysis.parsed_artifacts
