@@ -70,7 +70,7 @@ class Brave(Chrome):
                 log.info(" - %s" % input_file)
 
         # Process History files
-        custom_type_re = re.compile(r'__([A-z0-9\._]*)$')
+        custom_type_re = re.compile(r'__([A-Za-z0-9\._]*)$')
         for input_file in input_listing:
             if re.search(r'session-store-', input_file):
                 row_type = 'url'

@@ -3881,7 +3881,9 @@ class Chrome(WebBrowser):
         top_file_listing = os.listdir(top_path)
 
         # Only process directories with the expected naming convention
-        ext_id_re = re.compile(r'^([a-z]{32})$')
+        # (Chrome extension IDs are 32 chars in a-p: the first 128 bits of a
+        # SHA-256 of the extension's public key, with hex digits 0-f remapped to a-p)
+        ext_id_re = re.compile(r'^([a-p]{32})$')
         ext_listing = [str(x) for x in top_file_listing if ext_id_re.match(x)]
         log.debug(f' - {len(ext_listing)} files in {dir_name} directory will be processed: {str(ext_listing)}')
 
