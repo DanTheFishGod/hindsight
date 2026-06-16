@@ -24,7 +24,7 @@ def plugin(analysis_session=None):
     if analysis_session is None:
         return
 
-    google_re = re.compile(r'^http(s)?://www\.google(\.[A-z]{2,3})?(\.com)?(\.[A-z]{2,3})?/(search\?|webhp\?|#q)(.*)$')
+    google_re = re.compile(r'^http(s)?://www\.google(\.[A-Za-z]{2,3})?(\.com)?(\.[A-Za-z]{2,3})?/(search\?|webhp\?|#q)(.*)$')
     extract_parameters_re = re.compile(r'(.+?)=(.+)')
     qdr_re = re.compile(r'(s|n|h|d|w|m|y)(\d{0,9})')
     tbs_qdr_re = re.compile(r'qdr:(s|n|h|d|w|m|y)(\d{0,9})')
