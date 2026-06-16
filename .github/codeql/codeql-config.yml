@@ -1,0 +1,14 @@
+name: "Hindsight CodeQL config"
+
+# Hindsight is a local forensic CLI/GUI: by design it reads files inside the
+# evidence/profile directory the operator explicitly points it at, joining
+# hard-coded artifact filenames (e.g. "History", "Preferences", "prefs.js")
+# onto operator-supplied base paths. CodeQL's py/path-injection (CWE-22) flags
+# that pattern across the whole codebase (~27 alerts) even though the
+# "user-controlled" component is the operator's own input and the joined
+# filename is a constant, so every instance is a false positive here. Exclude
+# the query repo-wide instead of dismissing recurring per-line alerts (which
+# reappear on new lines in every PR).
+query-filters:
+  - exclude:
+      id: py/path-injection
