@@ -1958,10 +1958,13 @@ class Chrome(WebBrowser):
                                 if record.is_live:
                                     record_state = 'Live'
 
-                                record_source_path = storage_directory
+                                # Store the absolute path (consistent with the other
+                                # storage types); the XLSX render makes it relative to
+                                # the Profile, e.g. IndexedDB\<origin>.indexeddb.leveldb.
+                                record_source_path = os.path.join(idb_path, storage_directory)
                                 if record.external_value_path:
                                     record_source_path = os.path.join(
-                                        f'{origin}.indexeddb.blob', record.external_value_path)
+                                        idb_path, f'{origin}.indexeddb.blob', record.external_value_path)
 
                                 record_value = self.resolve_indexeddb_blob_refs(record, origin)
 
@@ -2161,7 +2164,6 @@ class Chrome(WebBrowser):
             self.artifacts_counts[preferences_file] = 0
             return
 
-        profile_folder = os.path.split(path)[1]
         timestamped_items = []
         count = 0
 
@@ -2205,7 +2207,7 @@ class Chrome(WebBrowser):
             ext = self._extensions_by_id.get(ext_id)
             if ext is None:
                 ext = Chrome.BrowserExtension(
-                    profile=profile_folder, ext_id=ext_id, name=name,
+                    profile=path, ext_id=ext_id, name=name,
                     description=manifest.get('description'), version=manifest.get('version'),
                     permissions=str(manifest.get('permissions')), manifest=json.dumps(manifest))
                 self._extensions_by_id[ext_id] = ext
