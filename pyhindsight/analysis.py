@@ -1122,6 +1122,21 @@ class AnalysisSession(object):
             used_sheet_names.add(name.lower())
             return name
 
+        def source_item(source, profile):
+            """Render a source path relative to its Profile (Timeline convention),
+            so Profile + this value together form the full path. Falls back to the
+            absolute path when the source isn't under the profile (or on a different
+            drive)."""
+            source = source or ''
+            if source and profile:
+                try:
+                    rel = os.path.relpath(source, profile)
+                    if not rel.startswith('..'):
+                        return rel
+                except ValueError:
+                    pass  # different drives on Windows -> keep absolute path
+            return source
+
         w = workbook.add_worksheet('Timeline')
         used_sheet_names.add('timeline')
 
@@ -1550,7 +1565,7 @@ class AnalysisSession(object):
         s.write(1, 4, f'Modification Time ({self.timezone})', header_format)
         s.write(1, 5, 'Interpretation', header_format)
         s.write(1, 6, 'Profile', header_format)
-        s.write(1, 7, 'Source Path', header_format)
+        s.write(1, 7, 'Source Item', header_format)
         s.write(1, 8, 'Database', header_format)
         s.write(1, 9, 'Sequence', header_format)
         s.write(1, 10, 'State', header_format)
@@ -1589,7 +1604,7 @@ class AnalysisSession(object):
                     s.write(row_number, 4, friendly_date(item.last_modified), black_date_format)
                     s.write(row_number, 5, item.interpretation, black_value_format)
                     s.write(row_number, 6, item.profile, black_value_format)
-                    s.write(row_number, 7, item.source_path, black_value_format)
+                    s.write(row_number, 7, source_item(item.source_path, item.profile), black_value_format)
                     s.write_number(row_number, 9, item.seq, black_value_format)
                     s.write_string(row_number, 10, item.state, black_value_format)
                     s.write(row_number, 11, item.file_exists, black_value_format)
@@ -1604,7 +1619,7 @@ class AnalysisSession(object):
                     s.write(row_number, 4, friendly_date(item.last_modified), black_date_format)
                     s.write(row_number, 5, item.interpretation, black_value_format)
                     s.write(row_number, 6, item.profile, black_value_format)
-                    s.write(row_number, 7, item.source_path, black_value_format)
+                    s.write(row_number, 7, source_item(item.source_path, item.profile), black_value_format)
                     s.write_number(row_number, 9, item.seq, black_value_format)
                     s.write_string(row_number, 10, item.state, black_value_format)
 
@@ -1615,7 +1630,7 @@ class AnalysisSession(object):
                     s.write_string(row_number, 3, item.value, black_value_format)
                     s.write(row_number, 5, item.interpretation, black_value_format)
                     s.write(row_number, 6, item.profile, black_value_format)
-                    s.write(row_number, 7, item.source_path, black_value_format)
+                    s.write(row_number, 7, source_item(item.source_path, item.profile), black_value_format)
                     s.write(row_number, 8, item.database, black_value_format)
                     s.write_number(row_number, 9, item.seq, black_value_format)
                     s.write_string(row_number, 10, item.state, black_value_format)
@@ -1627,7 +1642,7 @@ class AnalysisSession(object):
                     s.write_string(row_number, 3, item.value, black_value_format)
                     s.write(row_number, 5, item.interpretation, black_value_format)
                     s.write(row_number, 6, item.profile, black_value_format)
-                    s.write(row_number, 7, item.source_path, black_value_format)
+                    s.write(row_number, 7, source_item(item.source_path, item.profile), black_value_format)
                     # s.write(row_number, 8, item.database, black_value_format)
                     s.write_number(row_number, 9, item.seq, black_value_format)
                     s.write_string(row_number, 10, item.state, black_value_format)
@@ -1832,16 +1847,7 @@ class AnalysisSession(object):
             sw.write(row, 3, item.value or '', body_value_fmt)
             sw.write(row, 4, friendly_date(mod_time), body_date_fmt)
             sw.write_string(row, 5, item.profile or '', body_value_fmt)
-            # Source Item = path relative to Profile (Timeline convention).
-            source_display = item.source_path or ''
-            if source_display and item.profile:
-                try:
-                    rel = os.path.relpath(source_display, item.profile)
-                    if not rel.startswith('..'):
-                        source_display = rel
-                except ValueError:
-                    pass  # different drives on Windows -> keep absolute path
-            sw.write_string(row, 6, source_display, body_value_fmt)
+            sw.write_string(row, 6, source_item(item.source_path, item.profile), body_value_fmt)
 
             reg_id = _g(item, 'registration_id')
             if reg_id is not None:
@@ -2143,7 +2149,7 @@ class AnalysisSession(object):
         ext.write(1, 4, 'Value', header_format)
         ext.write(1, 5, 'Interpretation', header_format)
         ext.write(1, 6, 'Profile', header_format)
-        ext.write(1, 7, 'Source Path', header_format)
+        ext.write(1, 7, 'Source Item', header_format)
         ext.write(1, 8, 'Offset', header_format)
         ext.write(1, 9, 'Sequence', header_format)
         ext.write(1, 10, 'State', header_format)
@@ -2176,7 +2182,7 @@ class AnalysisSession(object):
                     ext.write_string(row_number, 4, item.value, black_value_format)
                     ext.write(row_number, 5, item.interpretation, black_value_format)
                     ext.write(row_number, 6, item.profile, black_value_format)
-                    ext.write(row_number, 7, item.source_path, black_value_format)
+                    ext.write(row_number, 7, source_item(item.source_path, item.profile), black_value_format)
                     ext.write(row_number, 8, item.offset, black_value_format)
                     ext.write_number(row_number, 9, item.seq, black_value_format)
                     ext.write_string(row_number, 10, item.state, black_value_format)
@@ -2206,7 +2212,7 @@ class AnalysisSession(object):
         sync_ws.write(1, 2, 'Value', header_format)
         sync_ws.write(1, 3, 'Interpretation', header_format)
         sync_ws.write(1, 4, 'Profile', header_format)
-        sync_ws.write(1, 5, 'Source Path', header_format)
+        sync_ws.write(1, 5, 'Source Item', header_format)
         sync_ws.write(1, 6, 'Offset', header_format)
         sync_ws.write(1, 7, 'Sequence', header_format)
         sync_ws.write(1, 8, 'State', header_format)
@@ -2234,7 +2240,7 @@ class AnalysisSession(object):
                     sync_ws.write_string(row_number, 2, item.value, black_value_format)
                     sync_ws.write(row_number, 3, item.interpretation, black_value_format)
                     sync_ws.write(row_number, 4, item.profile, black_value_format)
-                    sync_ws.write(row_number, 5, item.source_path, black_value_format)
+                    sync_ws.write(row_number, 5, source_item(item.source_path, item.profile), black_value_format)
                     sync_ws.write(row_number, 6, item.offset, black_value_format)
                     sync_ws.write_number(row_number, 7, item.seq, black_value_format)
                     sync_ws.write_string(row_number, 8, item.state, black_value_format)
@@ -2349,7 +2355,7 @@ class AnalysisSession(object):
                 sess_ws.set_column('F:F', 40)  # Title
                 sess_ws.set_column('G:G', 30)  # Properties
                 sess_ws.set_column('H:H', 20)  # Tab Group
-                sess_ws.set_column('I:I', 30)  # Profile
+                sess_ws.set_column('I:I', 60)  # Profile
 
                 window_header_format = workbook.add_format({
                     'font_color': 'white', 'bg_color': '#595959', 'bold': True})
@@ -2498,7 +2504,7 @@ class AnalysisSession(object):
                 ext_ws.set_column('E:E', 10)  # all_frames
                 ext_ws.set_column('F:F', 10)  # world
                 ext_ws.set_column('G:G', 50)  # JS / CSS
-                ext_ws.set_column('H:H', 30)  # Profile
+                ext_ws.set_column('H:H', 60)  # Profile
 
                 ext_header_format = workbook.add_format({
                     'font_color': 'white', 'bg_color': '#595959', 'bold': True})
