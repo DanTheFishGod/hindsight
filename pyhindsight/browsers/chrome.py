@@ -4216,7 +4216,10 @@ class Chrome(WebBrowser):
                             }
 
                             path_parts = re.split(r'[/\\]', backing_file_path)
-                            if path_parts != ['']:
+                            # Need at least two segments to index [0] and [1]; a
+                            # single-segment (or empty) path falls through to the else
+                            # branch, which joins the path as-is.
+                            if len(path_parts) >= 2:
                                 normalized_backing_file_path = os.path.join(
                                     path_nodes['0']['fs_path'], fs_type, path_parts[0], path_parts[1])
                                 file_exists, file_size, magic_results = self.get_local_file_info(
@@ -4238,7 +4241,10 @@ class Chrome(WebBrowser):
                         if not item['key'].startswith(b'CHILD_OF:'):
                             continue
 
-                        parent, name = item['key'][9:].split(b':')
+                        # Key format is CHILD_OF:<parent_id>:<name>. The name can itself
+                        # contain ':' (e.g. a filename with a colon), so split only on the
+                        # first delimiter; partition never raises if ':' is absent.
+                        parent, _, name = item['key'][9:].partition(b':')
 
                         path_node_key = item['value'].decode()
                         if item['value'] == b'':
