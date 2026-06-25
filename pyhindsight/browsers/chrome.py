@@ -2228,6 +2228,8 @@ class Chrome(WebBrowser):
             ext.update_time = update_dt
             ext.location = location_str
             ext.state = state_str
+            # Unpacked extensions store a source 'path' instead of a cached manifest.
+            ext.path = v.get('path')
             ext.from_webstore = v.get('from_webstore')
             ext.was_installed_by_default = v.get('was_installed_by_default')
             ext.granted_scriptable_host = granted_scriptable
@@ -3698,6 +3700,65 @@ class Chrome(WebBrowser):
         log.info(f' - Parsed {len(results)} {dir_name} items')
         self.parsed_extension_data.extend(results)
 
+    def get_dnr_extension_rules(self, path, dir_name):
+        """Parse declarativeNetRequest DYNAMIC rules from
+        ``<profile>/DNR Extension Rules/<ext_id>/rules.json``.
+        """
+        results = []
+        dnr_path = os.path.join(path, dir_name)
+        log.info(f'{dir_name}:')
+        log.info(f' - Reading from {dnr_path}')
+
+        if not os.path.isdir(dnr_path):
+            log.error(f' - {dnr_path} is not a directory')
+            self.artifacts_counts[dir_name] = 'Failed'
+            return
+
+        for ext_id in sorted(os.listdir(dnr_path)):
+            ext_dir = os.path.join(dnr_path, ext_id)
+            if not os.path.isdir(ext_dir):
+                continue
+
+            ext_name = self.get_extension_name_from_id(ext_id)
+            rules_json = os.path.join(ext_dir, 'rules.json')
+            if not os.path.isfile(rules_json):
+                # The indexed flatbuffer can exist without a JSON copy; flag it so the
+                # omission is visible rather than silently skipped.
+                if os.path.isfile(os.path.join(ext_dir, 'rules.fbs')):
+                    log.warning(f' - {ext_id}: rules.fbs present but no rules.json '
+                                f'(flatbuffer decode not yet supported)')
+                continue
+
+            try:
+                with open(rules_json, encoding='utf-8', errors='replace') as f:
+                    rules = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                log.warning(f' - Error reading {rules_json}: {e}')
+                continue
+
+            if not isinstance(rules, list):
+                log.warning(f' - Unexpected rules.json shape for {ext_id} (not a list)')
+                continue
+
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    continue
+                # The extension-assigned rule id (rule['id']) is the only key-like value
+                # in rules.json; surface it bare (the file itself is a flat JSON array
+                # with no real on-disk keys).
+                rule_id = rule.get('id')
+                parsed = Chrome.ExtensionStorageItem(
+                    profile=self.profile_path, extension_id=ext_id, extension_name=ext_name,
+                    key='' if rule_id is None else str(rule_id),
+                    value=json.dumps(rule, sort_keys=True),
+                    state='Live', source_path=rules_json)
+                parsed.row_type = dir_name.lower()
+                results.append(parsed)
+
+        self.artifacts_counts[dir_name] = len(results)
+        log.info(f' - Parsed {len(results)} {dir_name} items')
+        self.parsed_extension_data.extend(results)
+
     @staticmethod
     def _normalize_dynamic_script(entry):
         """Normalize a dynamically-registered script (Extension Scripts StateStore) to the
@@ -4827,6 +4888,12 @@ class Chrome(WebBrowser):
                         directory, directory, self.get_unified_extension_data,
                         self.profile_path, directory,
                         display_key=f'{directory}', display_value=f'{directory} records')
+
+            if 'DNR Extension Rules' in input_listing:
+                driver.run(
+                    'DNR Extension Rules', 'DNR Extension Rules', self.get_dnr_extension_rules,
+                    self.profile_path, 'DNR Extension Rules',
+                    display_key='DNR Extension Rules', display_value='DNR Extension Rules records')
 
             for directory in ['Local App Settings', 'Local Extension Settings',
                               'Managed Extension Settings', 'Sync App Settings', 'Sync Extension Settings']:
