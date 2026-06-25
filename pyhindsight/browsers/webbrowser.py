@@ -278,6 +278,13 @@ class WebBrowser(object):
         if self.installed_extensions and self.installed_extensions.get('data'):
             for extension in self.installed_extensions['data']:
                 if extension.ext_id == extension_id:
+                    if extension.name:
+                        return extension.name
+                    # Unpacked extensions cache no manifest in Secure Prefs, so the name
+                    # often isn't recoverable from the profile alone — surface the source
+                    # path instead (the lead an examiner needs to recover the name).
+                    if getattr(extension, 'path', None):
+                        return f"<unpacked - {extension.path}>"
                     return extension.name
             return "<Extension not found - may have been uninstalled>"
         return "<Unable to parse installed extensions>"
@@ -514,6 +521,10 @@ class WebBrowser(object):
             self.update_time = update_time
             self.location = location
             self.state = state
+            # Source folder for unpacked (developer-mode) extensions. Such extensions
+            # cache no manifest in Secure Preferences — only this path to the live
+            # source dir — so name/version often can't be resolved from the profile alone.
+            self.path = None
             self.from_webstore = from_webstore
             self.was_installed_by_default = was_installed_by_default
             # Host scope the extension can actually inject content scripts into

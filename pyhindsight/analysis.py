@@ -2562,8 +2562,14 @@ class AnalysisSession(object):
 
                 for ext in installed_extensions['data']:
                     # Parent (extension) header row, full width
-                    name = getattr(ext, 'name', None) or getattr(ext, 'ext_id', '')
                     ext_id = getattr(ext, 'ext_id', '')
+                    unpacked_path = getattr(ext, 'path', None)
+                    name = getattr(ext, 'name', None)
+                    if not name:
+                        # Unpacked extensions cache no manifest in Secure Prefs (only a
+                        # source 'path'), so the name often isn't recoverable here — fold
+                        # the path into the notation so the lead travels with the row.
+                        name = f'<unpacked - {unpacked_path}>' if unpacked_path else ext_id
                     parts = [f'{name} ({ext_id})']
                     if getattr(ext, 'state', None):
                         parts.append(f'State: {ext.state}')
@@ -2572,6 +2578,8 @@ class AnalysisSession(object):
                     parts.append(f'Found in: {getattr(ext, "source", "Unknown")}')
                     if getattr(ext, 'location', None):
                         parts.append(f'Install source: {ext.location}')
+                    if unpacked_path:
+                        parts.append(f'Unpacked path: {unpacked_path}')
                     if getattr(ext, 'from_webstore', None):
                         parts.append('From Web Store')
                     if getattr(ext, 'was_installed_by_default', None):
